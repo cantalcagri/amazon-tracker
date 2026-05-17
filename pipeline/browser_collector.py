@@ -67,9 +67,9 @@ PAGE_LOAD_TIMEOUT  = 90
 WAIT_TIMEOUT       = 45
 
 # Delays to appear human (seconds)
-DELAY_BETWEEN_PAGES  = (2, 5)
-DELAY_BETWEEN_ASINS  = (5, 10)
-DELAY_AFTER_SCROLL   = (0.5, 1.5)
+DELAY_BETWEEN_PAGES  = (1, 3)
+DELAY_BETWEEN_ASINS  = (3, 7)
+DELAY_AFTER_SCROLL   = (0.5, 1.0)
 
 
 def human_delay(range_s: tuple = (2, 5)):
@@ -257,15 +257,22 @@ class AmazonPageParser:
     # ── Navigate ──────────────────────────────────
     def _wait_for_keepa_injection(self, wait_seconds: int = 15):
         """
-        Flat wait after panel opens — gives Amazon time to render seller rows
-        and Keepa time to inject Stock numbers. 15s is the proven minimum.
+        Poll for Keepa stock injection instead of flat sleep.
+        Exits early as soon as stock data is visible (typically 5-10s).
+        Falls back to full wait_seconds if not found.
         """
-        time.sleep(wait_seconds)
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            time.sleep(1.5)
+            blocks = self.driver.find_elements(By.CSS_SELECTOR, ".aod-information-block")
+            texts = [self.driver.execute_script("return arguments[0].innerText;", b) or "" for b in blocks[:3]]
+            if any("Stock" in t for t in texts):
+                log.info("Keepa stock data ready (%d blocks)", len(blocks))
+                return
+        # Final check after full wait
         blocks = self.driver.find_elements(By.CSS_SELECTOR, ".aod-information-block")
         texts = [self.driver.execute_script("return arguments[0].innerText;", b) or "" for b in blocks]
-        if any("Stock" in t for t in texts):
-            log.info("Keepa stock data ready (%d blocks)", len(blocks))
-        elif any("Sold by" in t for t in texts):
+        if any("Sold by" in t for t in texts):
             log.warning("Seller names loaded but no Keepa stock (Keepa may not be logged in)")
         else:
             log.warning("AOD panel content not visible after %ds", wait_seconds)
@@ -796,9 +803,18 @@ def calculate_and_save(conn, asin: str, today: str, sellers: list,
 # ──────────────────────────────
 # MAIN PIPELINE
 # ──────────────────────────────
-def run_pipeline_for_asin(asin: str, parser: AmazonPageParser):
+def _dim_needs_update(conn, asin: str) -> bool:
+    """Return True if this ASIN is new or has any null fields in dim_product."""
+    row = conn.execute(
+        "SELECT title, brand, variation_size, variation_color FROM dim_product WHERE asin=?", (asin,)
+    ).fetchone()
+    if row is None:
+        return True  # new ASIN
+    return any(row[col] is None for col in ("title", "brand", "variation_size", "variation_color"))
+
+
+def run_pipeline_for_asin(asin: str, parser: AmazonPageParser, conn: sqlite3.Connection):
     today = date.today().isoformat()
-    hour  = datetime.now().hour
     log.info("── ASIN: %s ──", asin)
 
     # 1. Load product page
@@ -808,28 +824,33 @@ def run_pipeline_for_asin(asin: str, parser: AmazonPageParser):
 
     parser.scroll_to_bottom()   # trigger Keepa injection
 
-    # 2. Extract product info + BSR + variation
-    title    = parser.get_title()
-    brand    = parser.get_brand()
+    # 2. Extract dim fields only when needed (new ASIN or has nulls)
+    needs_dim = _dim_needs_update(conn, asin)
+    if needs_dim:
+        title    = parser.get_title()
+        brand    = parser.get_brand()
+        var_info = parser.get_variation_info()
+
+        # Standalone listing fallback: extract size/color from title
+        parent = var_info.get("parent_asin")
+        if (not parent or parent == asin) and not var_info.get("variation_size") and not var_info.get("variation_color"):
+            title_info = extract_variation_from_title(title)
+            if title_info:
+                var_info.update(title_info)
+                log.info("Standalone — size/color from title: %s / %s",
+                         title_info.get("variation_size"), title_info.get("variation_color"))
+    else:
+        title = brand = None
+        var_info = {}
+        log.info("dim_product already complete for %s — skipping dim scrape", asin)
+
     bsr_data = parser.get_bsr()
-    var_info = parser.get_variation_info()
     bsr_rank = bsr_data.get("rank")
     bsr_cat  = bsr_data.get("category", "Unknown")
 
-    # Standalone listing: parent_asin == asin (or missing) — no variation widget.
-    # Fall back to extracting size/color from the title.
-    parent = var_info.get("parent_asin")
-    is_standalone = not parent or parent == asin
-    if is_standalone and not var_info.get("variation_size") and not var_info.get("variation_color"):
-        title_info = extract_variation_from_title(title)
-        if title_info:
-            var_info.update(title_info)
-            log.info("Standalone listing — size/color extracted from title: %s / %s",
-                     title_info.get("variation_size"), title_info.get("variation_color"))
-
-    log.info("Title: %s | Brand: %s | BSR: %s | Parent: %s | Size: %s | Color: %s",
-             title, brand, bsr_rank,
-             var_info.get("parent_asin"), var_info.get("variation_size"), var_info.get("variation_color"))
+    log.info("BSR: %s | Parent: %s | Size: %s | Color: %s",
+             bsr_rank, var_info.get("parent_asin"),
+             var_info.get("variation_size"), var_info.get("variation_color"))
 
     human_delay(DELAY_BETWEEN_PAGES)
 
@@ -842,14 +863,12 @@ def run_pipeline_for_asin(asin: str, parser: AmazonPageParser):
         total_pages = parser.get_total_offer_pages()
         log.info("Offers page 1/%d: %d sellers found", total_pages, len(page_sellers))
 
-        # Page 2+ — scroll down in the already-open AOD panel to load more sellers
         for page_num in range(2, total_pages + 1):
             human_delay(DELAY_BETWEEN_PAGES)
             try:
-                # Scroll to bottom of AOD container to trigger next page load
                 aod = parser.driver.find_element(By.CSS_SELECTOR, "#aod-container, #aod-offer-list")
                 parser.driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", aod)
-                time.sleep(4)
+                time.sleep(3)
             except Exception:
                 break
             page_sellers = parser.get_sellers_from_offers_page()
@@ -862,25 +881,24 @@ def run_pipeline_for_asin(asin: str, parser: AmazonPageParser):
     log.info("Total sellers collected: %d for %s", len(all_sellers), asin)
 
     # 4. Save to DB
-    init_db()
-    with get_conn() as conn:
+    if needs_dim:
         upsert_product(conn, asin, title=title, brand=brand,
                        parent_asin=var_info.get("parent_asin"),
                        variation_size=var_info.get("variation_size"),
                        variation_color=var_info.get("variation_color"))
 
-        # Normalise + deduplicate: keep entry with inventory when same seller appears twice
-        seen: dict = {}
-        for s in all_sellers:
-            name = s.get("seller_name") or s.get("name") or "Unknown"
-            key = (name, s.get("fulfillment", "FBM"))
-            existing = seen.get(key)
-            if existing is None or (s.get("inventory") is not None and existing.get("inventory") is None):
-                seen[key] = {**s, "name": name}
-        sellers_clean = list(seen.values())
+    # Normalise + deduplicate: keep entry with inventory when same seller appears twice
+    seen: dict = {}
+    for s in all_sellers:
+        name = s.get("seller_name") or s.get("name") or "Unknown"
+        key = (name, s.get("fulfillment", "FBM"))
+        existing = seen.get(key)
+        if existing is None or (s.get("inventory") is not None and existing.get("inventory") is None):
+            seen[key] = {**s, "name": name}
+    sellers_clean = list(seen.values())
 
-        calculate_and_save(conn, asin, today, sellers_clean, bsr_rank, bsr_cat)
-        conn.commit()
+    calculate_and_save(conn, asin, today, sellers_clean, bsr_rank, bsr_cat)
+    conn.commit()
 
     log.info("Saved: %s | %d sellers | BSR #%s", asin, len(all_sellers), bsr_rank)
 
@@ -1044,6 +1062,9 @@ def run_all(asins: list, connect_port: int = 0):
     parser = AmazonPageParser(driver)
     batch_count = 0
 
+    init_db()
+    conn = get_conn()
+
     try:
         for i, asin in enumerate(remaining):
             asin = asin.strip()
@@ -1063,7 +1084,7 @@ def run_all(asins: list, connect_port: int = 0):
                 log.info("Chrome restarted successfully")
 
             try:
-                run_pipeline_for_asin(asin, parser)
+                run_pipeline_for_asin(asin, parser, conn)
                 completed.append(asin)
                 _save_checkpoint(today, completed)
                 batch_count += 1
@@ -1075,6 +1096,10 @@ def run_all(asins: list, connect_port: int = 0):
                 human_delay(DELAY_BETWEEN_ASINS)
 
     finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
         try:
             driver.quit()
         except Exception:
