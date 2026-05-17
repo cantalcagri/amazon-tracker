@@ -1,0 +1,26 @@
+# DB and runtime files
+pipeline/amazon_tracker.db
+pipeline/amazon_tracker.db-shm
+pipeline/amazon_tracker.db-wal
+pipeline/tracker.log
+pipeline/.tracker_checkpoint.json
+pipeline/.chrome_profile/
+
+# Secrets
+pipeline/.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store

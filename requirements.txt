@@ -1,0 +1,9 @@
+selenium>=4.18
+webdriver-manager>=4.0
+beautifulsoup4>=4.12
+lxml>=5.0
+schedule>=1.2
+python-dotenv>=1.0
+streamlit>=1.35
+plotly>=5.20
+pandas>=2.0
