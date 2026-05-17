@@ -67,9 +67,9 @@ PAGE_LOAD_TIMEOUT  = 90
 WAIT_TIMEOUT       = 45
 
 # Delays to appear human (seconds)
-DELAY_BETWEEN_PAGES  = (4, 9)
-DELAY_BETWEEN_ASINS  = (10, 20)
-DELAY_AFTER_SCROLL   = (1, 3)
+DELAY_BETWEEN_PAGES  = (2, 5)
+DELAY_BETWEEN_ASINS  = (5, 10)
+DELAY_AFTER_SCROLL   = (0.5, 1.5)
 
 
 def human_delay(range_s: tuple = (2, 5)):
@@ -205,6 +205,43 @@ def create_driver(headless: bool = False) -> webdriver.Chrome:
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
     return driver
+
+
+def extract_variation_from_title(title: str) -> dict:
+    """
+    Fallback for standalone listings (parent_asin == asin) where the variation
+    widget is absent. Extracts size and color from the product title.
+    """
+    if not title:
+        return {}
+    result = {}
+    # Size — ordered longest-first so "X-Large" matches before "Large"
+    SIZE_PATTERNS = [
+        r'\b(3X-?Large|3XL|XXXL)\b',
+        r'\b(2X-?Large|2XL|XXL)\b',
+        r'\b(X-?Large|XL)\b',
+        r'\b(X-?Small|XS)\b',
+        r'\b(Medium|MED)\b',
+        r'\b(Small|SM)\b',
+        r'\b(Large|LG)\b',
+        r'\b(One\s*Size|OS)\b',
+    ]
+    for pat in SIZE_PATTERNS:
+        m = re.search(pat, title, re.IGNORECASE)
+        if m:
+            result["variation_size"] = m.group(0).strip()
+            break
+    # Color — common apparel colors
+    COLORS = [
+        "Black", "White", "Gray", "Grey", "Navy", "Blue", "Red", "Green",
+        "Yellow", "Orange", "Purple", "Pink", "Brown", "Beige", "Tan",
+        "Olive", "Teal", "Burgundy", "Maroon", "Charcoal", "Ivory", "Cream",
+        "Khaki", "Camo", "Camouflage", "Multicolor",
+    ]
+    m = re.search(r'\b(' + '|'.join(COLORS) + r')\b', title, re.IGNORECASE)
+    if m:
+        result["variation_color"] = m.group(0).strip().title()
+    return result
 
 
 # ──────────────────────────────
@@ -778,6 +815,17 @@ def run_pipeline_for_asin(asin: str, parser: AmazonPageParser):
     var_info = parser.get_variation_info()
     bsr_rank = bsr_data.get("rank")
     bsr_cat  = bsr_data.get("category", "Unknown")
+
+    # Standalone listing: parent_asin == asin (or missing) — no variation widget.
+    # Fall back to extracting size/color from the title.
+    parent = var_info.get("parent_asin")
+    is_standalone = not parent or parent == asin
+    if is_standalone and not var_info.get("variation_size") and not var_info.get("variation_color"):
+        title_info = extract_variation_from_title(title)
+        if title_info:
+            var_info.update(title_info)
+            log.info("Standalone listing — size/color extracted from title: %s / %s",
+                     title_info.get("variation_size"), title_info.get("variation_color"))
 
     log.info("Title: %s | Brand: %s | BSR: %s | Parent: %s | Size: %s | Color: %s",
              title, brand, bsr_rank,
