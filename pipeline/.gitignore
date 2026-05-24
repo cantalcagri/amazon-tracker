@@ -1,0 +1,16 @@
+.chrome_profile/
+tracker.log
+amazon_tracker.db
+amazon_tracker.db-shm
+amazon_tracker.db-wal
+.env
+
+# Logs
+*.log
+
+# Keepa CSV exports (kept locally only)
+keepa_exports/
+
+# Scratch / one-off
+test_*.txt
+.tracker_checkpoint.json

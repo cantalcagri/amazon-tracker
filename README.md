@@ -169,3 +169,73 @@ WHERE product_id=1 ORDER BY snapshot_date;
 -- Manual cleanup
 DELETE FROM fact_seller_snapshot WHERE snapshot_date < date('now','-10 days');
 ```
+
+---
+
+## Keepa Viewer Export (automated CSV download → SQLite)
+
+Pulls the full Keepa **Product Viewer** CSV for a list of ASINs and imports it into the cumulative `fct_keepa_daily` table — no manual clicks.
+
+**What it captures per ASIN per day** (cumulative, never purged):
+- BSR current + 30-day average
+- Buy-box price, stock, seller name
+- 90-day OOS%
+- Monthly sold estimate
+- `% Top Seller` for 30 and 90 days
+- Full raw row dumped to `raw_json` so nothing is ever lost
+
+### One-time setup
+
+1. Launch an **isolated** Chrome window (does NOT touch your regular Chrome):
+   ```bash
+   open -na "Google Chrome" --args \
+     --user-data-dir="$(pwd)/pipeline/.chrome_profile" \
+     --remote-debugging-port=9222
+   ```
+2. In that new window, sign into [keepa.com](https://keepa.com) once. The session is saved in `pipeline/.chrome_profile/` so you only do this once.
+
+### Daily run
+
+```bash
+cd pipeline
+python keepa_viewer_export.py --asins-file ../keepa_pipeline/data/asins.txt
+```
+
+That single command:
+1. Attaches to the isolated Chrome via CDP (port 9222)
+2. Builds the Keepa viewer URL with all ASINs hash-encoded
+3. Clicks **Export → CSV** automatically
+4. Saves the CSV to `pipeline/keepa_exports/keepa_viewer_<timestamp>_<count>asins.csv`
+5. Imports rows into `fct_keepa_daily` (re-running the same day overwrites — idempotent)
+
+Useful flags:
+- `--no-import` — skip the SQLite import (just save the CSV)
+- `--keep-tab` — leave the Keepa viewer tab open after export
+- `--asins-file PATH` — override the input file (default: `pipeline/asins.txt`)
+
+### View the data
+
+```bash
+DB_PATH=pipeline/amazon_tracker.db streamlit run dashboard/dashboard.py
+```
+
+The dashboard has two views:
+- **📊 Overview** — KPIs (total ASINs, avg BSR, OOS counts), daily coverage chart, latest-snapshot table
+- **🔎 Per-ASIN drilldown** — BSR trend with 30-day average overlay, buy-box price + stock chart, raw snapshot history
+
+### Re-importing an existing CSV (no Chrome needed)
+
+```bash
+cd pipeline
+python keepa_csv_importer.py keepa_exports/keepa_viewer_20260524_011911_1073asins.csv
+```
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Couldn't connect to 127.0.0.1:9222` | Isolated Chrome isn't running. Re-run the one-time setup command. |
+| Table loads but Export button times out | Keepa changed selectors. Update `.tool__export` / `#exportSubmit` in `keepa_viewer_export.py`. |
+| Only a few rows imported | Check `--asins-file` points at the real master list (not the 252-row test subset). |
+| `no such column: product_id` in dashboard | Old `dashboard.py` cached. Restart Streamlit. |
+

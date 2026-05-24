@@ -36,3 +36,27 @@ CREATE TABLE IF NOT EXISTS fct_asin_daily (
     PRIMARY KEY (snapshot_date, asin)
 );
 CREATE INDEX IF NOT EXISTS idx_fct_asin_daily_asin ON fct_asin_daily(asin);
+
+-- fct_keepa_daily: cumulative daily snapshot from Keepa Product Viewer CSV.
+-- One row per ASIN per day. Never purged. Typed columns for the fields we
+-- chart most; raw_json keeps every other CSV column so we never lose data
+-- if Keepa adds new columns or we want to add a chart later.
+CREATE TABLE IF NOT EXISTS fct_keepa_daily (
+    snapshot_date         DATE NOT NULL,
+    asin                  TEXT NOT NULL REFERENCES dim_product(asin),
+    sales_rank_current    INTEGER,
+    sales_rank_30d_avg    INTEGER,
+    display_group         TEXT,
+    monthly_sold          TEXT,
+    monthly_sold_date     TEXT,
+    buy_box_price         REAL,
+    buy_box_stock         INTEGER,
+    oos_90d_pct           REAL,
+    buy_box_seller        TEXT,
+    pct_top_seller_30d    REAL,
+    pct_top_seller_90d    REAL,
+    is_fba_pct            REAL,
+    raw_json              TEXT,
+    PRIMARY KEY (snapshot_date, asin)
+);
+CREATE INDEX IF NOT EXISTS idx_fct_keepa_daily_asin ON fct_keepa_daily(asin);
