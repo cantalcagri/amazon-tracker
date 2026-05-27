@@ -10,6 +10,7 @@ amazon_tracker.db-wal
 
 # Keepa CSV exports (kept locally only)
 keepa_exports/
+keepa_offers_exports/
 
 # Scratch / one-off
 test_*.txt

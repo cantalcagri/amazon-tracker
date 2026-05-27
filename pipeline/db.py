@@ -28,17 +28,20 @@ def init_db():
 
 
 def upsert_product(conn, asin, title=None, brand=None,
-                   parent_asin=None, variation_size=None, variation_color=None):
+                   parent_asin=None, variation_size=None, variation_color=None,
+                   image_url=None):
     conn.execute("""
-        INSERT INTO dim_product (asin, parent_asin, title, brand, variation_size, variation_color)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO dim_product (asin, parent_asin, title, brand,
+                                  variation_size, variation_color, image_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(asin) DO UPDATE SET
             title           = COALESCE(excluded.title, title),
             brand           = COALESCE(excluded.brand, brand),
             parent_asin     = COALESCE(excluded.parent_asin, parent_asin),
             variation_size  = COALESCE(excluded.variation_size, variation_size),
-            variation_color = COALESCE(excluded.variation_color, variation_color)
-    """, (asin, parent_asin, title, brand, variation_size, variation_color))
+            variation_color = COALESCE(excluded.variation_color, variation_color),
+            image_url       = COALESCE(excluded.image_url, image_url)
+    """, (asin, parent_asin, title, brand, variation_size, variation_color, image_url))
 
 
 def purge_old_snapshots(conn):

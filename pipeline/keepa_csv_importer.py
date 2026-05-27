@@ -38,18 +38,31 @@ FIELD_PATTERNS: dict[str, list[str]] = {
     "asin":               [r"^asin$"],
     "title":              [r"^title$", r"product title"],
     "brand":              [r"^brand$", r"manufacturer"],
-    "sales_rank_current": [r"sales\s*rank.*current", r"^current.*sales\s*rank"],
+    "parent_asin":        [r"parent\s*asin"],
+    "color":              [r"^color$"],
+    "size":               [r"^size$"],
+    "image_url":          [r"swatch\s*image", r"^image\s*url$", r"image$"],
+    "sales_rank_current": [r"^sales\s*rank.*current"],
     "sales_rank_30d_avg": [r"sales\s*rank.*30\s*day", r"30\s*day.*sales\s*rank"],
-    "display_group":      [r"display\s*group", r"^category$", r"product\s*group"],
+    "display_group":      [r"display\s*group", r"product\s*group"],
     "monthly_sold":       [r"monthly\s*sold(?!\s*date)"],
     "monthly_sold_date":  [r"monthly\s*sold\s*date"],
-    "buy_box_price":      [r"buy\s*box.*current", r"buy\s*box.*price"],
-    "buy_box_stock":      [r"buy\s*box.*stock", r"^stock$"],
+    "buy_box_price":      [r"^buy\s*box:\s*current", r"buy\s*box.*price"],
+    "buy_box_stock":      [r"^buy\s*box:\s*stock"],
     "oos_90d_pct":        [r"90\s*day.*oos", r"oos.*90"],
     "buy_box_seller":     [r"buy\s*box\s*seller"],
     "pct_top_seller_30d": [r"%?\s*top\s*seller.*30"],
     "pct_top_seller_90d": [r"%?\s*top\s*seller.*90"],
-    "is_fba_pct":         [r"is\s*fba", r"%\s*fba"],
+    "is_fba_pct":         [r"^buy\s*box:\s*is\s*fba", r"%\s*fba"],
+    # NEW: offer counts, FBA/FBM stock and prices
+    "fba_offers":         [r"^new\s*fba\s*offer\s*count.*current",
+                           r"buy\s*box.*eligible.*new\s*fba"],
+    "fbm_offers":         [r"^new\s*fbm\s*offer\s*count.*current",
+                           r"buy\s*box.*eligible.*new\s*fbm"],
+    "total_offers":       [r"^total\s*offer\s*count"],
+    "fba_stock":          [r"3rd\s*party\s*fba.*stock"],
+    "fba_price":          [r"3rd\s*party\s*fba.*current"],
+    "fbm_price":          [r"3rd\s*party\s*fbm.*current"],
 }
 
 
@@ -137,17 +150,28 @@ def import_csv(csv_path: Path, snapshot: date | None = None) -> int:
                 skipped += 1
                 continue
 
-            title = to_text(row.get(cols["title"])) if "title" in cols else None
-            brand = to_text(row.get(cols["brand"])) if "brand" in cols else None
-            upsert_product(conn, asin, title=title, brand=brand)
+            title       = to_text(row.get(cols["title"]))       if "title" in cols else None
+            brand       = to_text(row.get(cols["brand"]))       if "brand" in cols else None
+            parent_asin = to_text(row.get(cols["parent_asin"])) if "parent_asin" in cols else None
+            color       = to_text(row.get(cols["color"]))       if "color" in cols else None
+            size        = to_text(row.get(cols["size"]))        if "size" in cols else None
+            image_url   = to_text(row.get(cols["image_url"]))   if "image_url" in cols else None
+            upsert_product(
+                conn, asin, title=title, brand=brand,
+                parent_asin=parent_asin,
+                variation_color=color, variation_size=size,
+                image_url=image_url,
+            )
 
+            monthly_sold_raw = to_text(row.get(cols.get("monthly_sold", "")))
             values = {
                 "snapshot_date":      snapshot.isoformat(),
                 "asin":               asin,
                 "sales_rank_current": to_int(row.get(cols.get("sales_rank_current", ""))),
                 "sales_rank_30d_avg": to_int(row.get(cols.get("sales_rank_30d_avg", ""))),
                 "display_group":      to_text(row.get(cols.get("display_group", ""))),
-                "monthly_sold":       to_text(row.get(cols.get("monthly_sold", ""))),
+                "monthly_sold":       monthly_sold_raw,
+                "monthly_sold_num":   to_int(monthly_sold_raw),
                 "monthly_sold_date":  to_text(row.get(cols.get("monthly_sold_date", ""))),
                 "buy_box_price":      to_float(row.get(cols.get("buy_box_price", ""))),
                 "buy_box_stock":      to_int(row.get(cols.get("buy_box_stock", ""))),
@@ -156,6 +180,12 @@ def import_csv(csv_path: Path, snapshot: date | None = None) -> int:
                 "pct_top_seller_30d": to_float(row.get(cols.get("pct_top_seller_30d", ""))),
                 "pct_top_seller_90d": to_float(row.get(cols.get("pct_top_seller_90d", ""))),
                 "is_fba_pct":         to_float(row.get(cols.get("is_fba_pct", ""))),
+                "fba_offers":         to_int(row.get(cols.get("fba_offers", ""))),
+                "fbm_offers":         to_int(row.get(cols.get("fbm_offers", ""))),
+                "total_offers":       to_int(row.get(cols.get("total_offers", ""))),
+                "fba_stock":          to_int(row.get(cols.get("fba_stock", ""))),
+                "fba_price":          to_float(row.get(cols.get("fba_price", ""))),
+                "fbm_price":          to_float(row.get(cols.get("fbm_price", ""))),
                 "raw_json":           json.dumps(row, ensure_ascii=False),
             }
 
@@ -163,14 +193,20 @@ def import_csv(csv_path: Path, snapshot: date | None = None) -> int:
                 """
                 INSERT OR REPLACE INTO fct_keepa_daily (
                     snapshot_date, asin, sales_rank_current, sales_rank_30d_avg,
-                    display_group, monthly_sold, monthly_sold_date,
+                    display_group, monthly_sold, monthly_sold_num, monthly_sold_date,
                     buy_box_price, buy_box_stock, oos_90d_pct, buy_box_seller,
-                    pct_top_seller_30d, pct_top_seller_90d, is_fba_pct, raw_json
+                    pct_top_seller_30d, pct_top_seller_90d, is_fba_pct,
+                    fba_offers, fbm_offers, total_offers,
+                    fba_stock, fba_price, fbm_price,
+                    raw_json
                 ) VALUES (
                     :snapshot_date, :asin, :sales_rank_current, :sales_rank_30d_avg,
-                    :display_group, :monthly_sold, :monthly_sold_date,
+                    :display_group, :monthly_sold, :monthly_sold_num, :monthly_sold_date,
                     :buy_box_price, :buy_box_stock, :oos_90d_pct, :buy_box_seller,
-                    :pct_top_seller_30d, :pct_top_seller_90d, :is_fba_pct, :raw_json
+                    :pct_top_seller_30d, :pct_top_seller_90d, :is_fba_pct,
+                    :fba_offers, :fbm_offers, :total_offers,
+                    :fba_stock, :fba_price, :fbm_price,
+                    :raw_json
                 )
                 """,
                 values,
