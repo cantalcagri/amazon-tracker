@@ -5,6 +5,14 @@ It gives Claude full context about this project so you don't have to re-explain 
 
 ---
 
+## ⛔ ABSOLUTE RULES — NEVER VIOLATE
+
+1. **NEVER run `pkill` or `kill` on "Google Chrome"** — this logs the user out of all accounts and destroys their session. It has happened and caused serious disruption. There is no exception.
+2. **NEVER touch the user's real Chrome profile** at `~/Library/Application Support/Google/Chrome` — copying, deleting, or modifying it has broken their extensions before.
+3. To launch Chrome for the CSV exporter: launch manually with `open -a "Google Chrome" --args --remote-debugging-port=9222` and let `keepa_viewer_export.py` attach via CDP. (The archived scraper used `create_driver()` + `--user-data-dir=pipeline/.chrome_profile`.)
+
+---
+
 ## What this project does
 
 Tracks Amazon product listings daily:
@@ -40,19 +48,37 @@ amazon-tracker/
 ├── CLAUDE.md                        ← you are here
 ├── requirements.txt
 ├── schema/
-│   └── schema.sql                   ← SQLite schema (run once to init DB)
-├── pipeline/
-│   ├── browser_collector.py         ← MAIN SCRIPT: Selenium + Keepa Chrome extension
-│   ├── keepa_collector.py           ← Alternative: Keepa API mode (token-costly, rarely used)
-│   ├── asins.txt                    ← one ASIN per line, # = comment
-│   ├── .chrome_profile/             ← tracker's own Chrome profile (Keepa session saved here)
+│   └── schema.sql                   ← SQLite schema + views (safe to re-run)
+├── pipeline/                        ← ACTIVE pipeline (only 5 scripts run)
+│   ├── keepa_viewer_export.py       ← Selenium → Keepa Viewer CSV (aggregate daily)
+│   ├── keepa_csv_importer.py        ← imports that CSV → fct_keepa_daily
+│   ├── keepa_api_offers.py          ← MAIN per-seller collector (API, --tick)
+│   ├── replenishment.py             ← SHIP/HOLD/AVOID recommendation engine
+│   ├── db.py                        ← shared SQLite helpers
+│   ├── health_check.py              ← data-quality guardrails + seller housekeeping
+│   ├── asins.txt                    ← legacy 252-ASIN subset (kept as fallback)
+│   ├── .chrome_profile/             ← tracker's own Chrome profile (Keepa session)
 │   └── .env                         ← secrets/config (not in git)
+├── data/
+│   └── asins.txt                    ← 1,073-ASIN master list (primary input)
 ├── dashboard/
 │   ├── dashboard.py                 ← Streamlit analytics dashboard
 │   └── explore.ipynb                ← Jupyter notebook for ad-hoc SQL queries
+├── dash_app/                        ← Plotly Dash app (DuckDB-over-SQLite, zero-ETL)
+│   ├── app.py                       ← run: DB_PATH=pipeline/amazon_tracker.db python3 dash_app/app.py
+│   └── data.py                      ← DuckDB data-access layer (attaches SQLite read-only)
+├── scripts/
+│   └── daily_pipeline.sh            ← orchestration: runs the full daily pipeline
+├── docs/                            ← reference + recovery runbooks
 └── config/
     └── .env.template                ← copy this to pipeline/.env
 ```
+
+> **Note:** The original Selenium AOD scraper and several earlier collector attempts
+> have been deleted. The per-seller stock/price history now comes from the Keepa
+> **API** (`keepa_api_offers.py`), not the browser AOD panel. The Chrome/AOD sections
+> below are retained as historical reference only and do not describe code that still
+> exists in this repo.
 
 ---
 

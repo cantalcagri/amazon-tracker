@@ -55,4 +55,4 @@ Perfect for: writing custom queries, ad-hoc analysis, exporting subsets.
 
 ## Or use the Jupyter notebook
 
-`dashboard/explore_keepa_pipeline.ipynb` has pre-built queries for every table, plus joins and charts. Open it in VS Code with the Jupyter extension installed and click "Run All".
+`dashboard/explore.ipynb` is the ad-hoc SQL exploration notebook. Open it in VS Code with the Jupyter extension installed.

@@ -5,6 +5,15 @@ pipeline/amazon_tracker.db-wal
 pipeline/tracker.log
 pipeline/.tracker_checkpoint.json
 pipeline/.chrome_profile/
+pipeline/*.log
+pipeline/keepa_exports/
+
+# Orchestration runtime output
+logs/
+backups/
+
+# Claude Code per-user settings
+.claude/
 
 # Secrets
 pipeline/.env

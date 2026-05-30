@@ -56,6 +56,11 @@ SAFETY_BUFFER     = 50    # keep this many tokens unspent
 # Keepa epoch: their timestamps are minutes since 2011-01-01 (UTC)
 KEEPA_EPOCH_MIN = 21564000  # offset to convert keepa-minute → unix-minute
 
+# Cutoff: only store events newer than this many days. Keepa returns up to
+# 9 years of history per call, but we don't need it — 90 days is enough for
+# velocity, restock detection, and recent-trend charts. Saves DB space.
+HISTORY_RETENTION_DAYS = 90
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -106,6 +111,99 @@ def fetch_products(asins: list[str]) -> dict:
              r.status_code, elapsed, data.get("tokensConsumed"),
              data.get("tokensLeft"), len(data.get("products", [])))
     return data
+
+
+def fetch_seller_names(seller_ids: list[str]) -> dict:
+    """Look up seller names + ratings. Costs 1 token per seller, up to 100/call."""
+    params = {
+        "key": API_KEY, "domain": DOMAIN,
+        "seller": ",".join(seller_ids[:100]),
+    }
+    log.info("Seller lookup: %d sellers", len(seller_ids))
+    r = requests.get(f"{KEEPA_BASE}/seller", params=params, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    log.info("  → tokensConsumed=%s · tokensLeft=%s · sellers returned=%d",
+             data.get("tokensConsumed"), data.get("tokensLeft"),
+             len(data.get("sellers", {})))
+    return data
+
+
+def update_seller_names(conn: sqlite3.Connection, only_missing: bool = True,
+                         only_active_days: int = 90) -> int:
+    """Fetch + persist seller name/rating for sellers with recent activity.
+
+    If only_missing=True (default), skips sellers we already have a name for.
+    If only_active_days set, restricts to sellers with stock events in that window
+    (avoids spending tokens on dormant sellers).
+    Returns # of sellers updated.
+    """
+    # Get list of seller_ids to fetch — restricted to those with recent activity
+    where_parts = []
+    if only_missing:
+        where_parts.append("(d.seller_name IS NULL OR d.seller_name = '')")
+    if only_active_days:
+        where_parts.append(
+            f"EXISTS (SELECT 1 FROM fct_keepa_seller_history h "
+            f"        WHERE h.seller_id = d.seller_id "
+            f"          AND h.change_time >= datetime('now', '-{only_active_days} days'))"
+        )
+    where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    rows = conn.execute(f"SELECT d.seller_id FROM dim_keepa_seller d {where}").fetchall()
+    seller_ids = [r["seller_id"] for r in rows]
+    if not seller_ids:
+        log.info("No sellers need name lookup.")
+        return 0
+    log.info("Scope: %d sellers (only_missing=%s, only_active_days=%s)",
+             len(seller_ids), only_missing, only_active_days)
+
+    # Token guard — need ~1 per seller plus a small buffer
+    try:
+        balance = get_tokens_left()
+    except Exception as e:
+        log.error("Token check failed: %s", e)
+        return 0
+    needed = len(seller_ids) + SAFETY_BUFFER
+    if balance < needed:
+        # Reduce to what we can afford
+        max_affordable = max(0, balance - SAFETY_BUFFER)
+        log.warning("Token-capped: budget %d, need %d. Will fetch %d / %d sellers.",
+                    balance, needed, max_affordable, len(seller_ids))
+        seller_ids = seller_ids[:max_affordable]
+    if not seller_ids:
+        log.info("Not enough tokens to fetch any seller names.")
+        return 0
+
+    now = datetime.now(timezone.utc).isoformat()
+    updated = 0
+    # Batch in 100s (Keepa max per call)
+    for chunk_start in range(0, len(seller_ids), 100):
+        chunk = seller_ids[chunk_start:chunk_start + 100]
+        data = fetch_seller_names(chunk)
+        sellers = data.get("sellers", {}) or {}
+        for sid, info in sellers.items():
+            name = info.get("sellerName")
+            rating = info.get("currentRating")
+            rating_count = info.get("currentRatingCount")
+            is_amazon = 1 if info.get("isScammer") is False and sid == "ATVPDKIKX0DER" else 0
+            conn.execute("""
+                INSERT INTO dim_keepa_seller (seller_id, seller_name, rating_pct,
+                                              review_count, is_amazon, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(seller_id) DO UPDATE SET
+                    seller_name  = COALESCE(excluded.seller_name, seller_name),
+                    rating_pct   = COALESCE(excluded.rating_pct, rating_pct),
+                    review_count = COALESCE(excluded.review_count, review_count),
+                    is_amazon    = COALESCE(excluded.is_amazon, is_amazon),
+                    updated_at   = excluded.updated_at
+            """, (sid, name, rating, rating_count, is_amazon, now))
+            updated += 1
+        conn.commit()
+        # Politeness pause between batches
+        if chunk_start + 100 < len(seller_ids):
+            time.sleep(1)
+    log.info("Updated %d seller names", updated)
+    return updated
 
 
 # ── Queue selection ───────────────────────────────────────────────────────
@@ -165,8 +263,14 @@ def parse_and_save(conn: sqlite3.Connection, products: list[dict]) -> dict:
       - asin_api_state (fetch success bookkeeping)
     Returns counts dict for the run.
     """
-    now = datetime.now(timezone.utc).isoformat()
-    stats = {"asins": 0, "sellers_seen": 0, "stock_events": 0, "price_events": 0}
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    # Only keep events from the last HISTORY_RETENTION_DAYS — Keepa returns 9+ years
+    # of history per call but we only need recent for velocity / restock detection.
+    cutoff_keepa_min = int((now_dt.timestamp() / 60) - KEEPA_EPOCH_MIN
+                           - HISTORY_RETENTION_DAYS * 24 * 60)
+    stats = {"asins": 0, "sellers_seen": 0, "stock_events": 0, "price_events": 0,
+             "skipped_old": 0}
 
     for p in products:
         asin = p["asin"]
@@ -207,12 +311,21 @@ def parse_and_save(conn: sqlite3.Connection, products: list[dict]) -> dict:
             is_prime = 1 if o.get("isPrime") else 0
 
             # stockCSV format: [time1, stock1, time2, stock2, ...]
+            # SKIP events older than HISTORY_RETENTION_DAYS — saves DB space
             stock_csv = o.get("stockCSV") or []
             for i in range(0, len(stock_csv), 2):
                 if i + 1 >= len(stock_csv):
                     break
                 tmin, stk = stock_csv[i], stock_csv[i + 1]
-                if stk is None or stk < 0:
+                if stk is None:
+                    continue
+                # Keepa emits stk = -1 when the seller is no longer offering the
+                # item. Treat as stock=0 so v_asin_daily_sales credits the
+                # previously-observed inventory as sold (seller-disappeared case).
+                if stk < 0:
+                    stk = 0
+                if tmin < cutoff_keepa_min:
+                    stats["skipped_old"] += 1
                     continue
                 change_time = keepa_minute_to_datetime(tmin).isoformat()
                 conn.execute("""
@@ -229,6 +342,9 @@ def parse_and_save(conn: sqlite3.Connection, products: list[dict]) -> dict:
                     break
                 tmin, pcents, ship = offer_csv[i], offer_csv[i + 1], offer_csv[i + 2]
                 if pcents is None or pcents < 0:
+                    continue
+                if tmin < cutoff_keepa_min:
+                    stats["skipped_old"] += 1
                     continue
                 change_time = keepa_minute_to_datetime(tmin).isoformat()
                 # Merge with stock row if same (asin, seller, time) — else new
@@ -308,7 +424,8 @@ def show_status(conn: sqlite3.Connection) -> None:
 
 
 # ── Main run ──────────────────────────────────────────────────────────────
-def tick(conn: sqlite3.Connection, dry_run: bool = False) -> int:
+def tick(conn: sqlite3.Connection, dry_run: bool = False,
+         batch_size: int = MAX_BATCH_SIZE) -> int:
     """One tick: pick a batch, fetch, save. Returns # ASINs processed."""
     if not API_KEY:
         log.error("KEEPA_API_KEY not set in environment / .env")
@@ -327,21 +444,17 @@ def tick(conn: sqlite3.Connection, dry_run: bool = False) -> int:
         return 0
 
     # 2. Pick the batch
-    asins = pick_next_batch(conn, batch_size=MAX_BATCH_SIZE)
+    batch_size = max(1, min(batch_size, MAX_BATCH_SIZE))
+    asins = pick_next_batch(conn, batch_size=batch_size)
     if not asins:
         log.info("No ASINs eligible for fetch (catalog empty?)")
         return 0
 
-    # Cap batch size based on token budget — assume worst-case 6 tokens/ASIN
-    spendable = max(0, balance - SAFETY_BUFFER)
-    max_affordable = spendable // 6
-    if max_affordable < len(asins):
-        log.info("Token-capped batch: %d → %d (balance=%d, buffer=%d)",
-                 len(asins), max_affordable, balance, SAFETY_BUFFER)
-        asins = asins[:max_affordable]
-    if not asins:
-        log.info("Not enough tokens for even 1 ASIN — skipping tick")
-        return 0
+    # Keepa lets a single call go negative on tokens (call succeeds, then we
+    # wait for refill). So once we're above MIN_TOKENS_TO_RUN, just send the
+    # full 100. The MIN_TOKENS_TO_RUN gate above (150) ensures the deficit
+    # afterward is bounded (~150 - 400 = -250, refills in ~50 min at 5/min).
+    log.info("Sending full batch of %d ASINs (balance may go negative, refills 5/min)", len(asins))
 
     if dry_run:
         print(f"[DRY RUN] Would fetch {len(asins)} ASINs:")
@@ -363,8 +476,19 @@ def tick(conn: sqlite3.Connection, dry_run: bool = False) -> int:
 
     # 4. Parse + save
     stats = parse_and_save(conn, products)
-    log.info("Saved: %d ASINs · %d stock events · %d price events",
-             stats["asins"], stats["stock_events"], stats["price_events"])
+    log.info("Saved: %d ASINs · %d stock events · %d price events (skipped %d older than 90d)",
+             stats["asins"], stats["stock_events"], stats["price_events"], stats.get("skipped_old", 0))
+
+    # 5. Auto-resolve names for any brand-new seller_ids we just discovered.
+    # only_missing=True skips sellers we already have a name for, so we spend
+    # exactly 1 token per truly-new seller — name mapping is permanent.
+    try:
+        n_named = update_seller_names(conn, only_missing=True, only_active_days=HISTORY_RETENTION_DAYS)
+        if n_named:
+            log.info("Auto-resolved %d new seller name(s)", n_named)
+    except Exception as e:
+        log.warning("Auto seller-name resolution failed (non-fatal): %s", e)
+
     return stats["asins"]
 
 
@@ -377,14 +501,25 @@ def main() -> int:
                    help="Comma-separated ASINs to fetch immediately")
     g.add_argument("--status", action="store_true",
                    help="Show token balance + queue stats, no API call")
+    g.add_argument("--seller-names", action="store_true",
+                   help="Fetch missing seller names via /seller endpoint (1 token/seller)")
+    ap.add_argument("--refresh-all-names", action="store_true",
+                    help="With --seller-names: re-fetch ALL seller names (not just missing)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Show what WOULD be fetched without spending tokens")
+    ap.add_argument("--batch-size", type=int, default=MAX_BATCH_SIZE,
+                    help=f"ASINs per --tick call (1-{MAX_BATCH_SIZE}, default {MAX_BATCH_SIZE}). "
+                         "Smaller = more frequent refresh of hot ASINs, less burst-cap waste.")
     args = ap.parse_args()
 
     conn = get_conn()
     try:
         if args.status:
             show_status(conn)
+            return 0
+        if args.seller_names:
+            n = update_seller_names(conn, only_missing=not args.refresh_all_names)
+            print(f"Updated {n} seller names")
             return 0
         if args.asins:
             asins = [a.strip() for a in args.asins.split(",") if a.strip()]
@@ -393,11 +528,11 @@ def main() -> int:
                 return 0
             data = fetch_products(asins)
             stats = parse_and_save(conn, data.get("products", []) or [])
-            log.info("Saved: %d ASINs · %d stock events · %d price events",
-                     stats["asins"], stats["stock_events"], stats["price_events"])
+            log.info("Saved: %d ASINs · %d stock events · %d price events (skipped %d older than 90d)",
+                     stats["asins"], stats["stock_events"], stats["price_events"], stats.get("skipped_old", 0))
             return 0
         if args.tick:
-            tick(conn, dry_run=args.dry_run)
+            tick(conn, dry_run=args.dry_run, batch_size=args.batch_size)
             return 0
     finally:
         conn.close()

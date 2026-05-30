@@ -198,7 +198,7 @@ Pulls the full Keepa **Product Viewer** CSV for a list of ASINs and imports it i
 
 ```bash
 cd pipeline
-python keepa_viewer_export.py --asins-file ../keepa_pipeline/data/asins.txt
+python keepa_viewer_export.py --asins-file ../data/asins.txt
 ```
 
 That single command:

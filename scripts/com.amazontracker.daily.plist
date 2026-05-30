@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job for the daily pipeline (macOS — preferred over cron on the Mac mini).
+
+  SETUP on the Mac mini:
+    1. Edit the paths below: replace /Users/cagri/Desktop/amazon-tracker with the
+       repo's location on the mini, and set the correct PYTHON path
+       (run `which python3`).
+    2. Copy into place:
+         cp scripts/com.amazontracker.daily.plist ~/Library/LaunchAgents/
+    3. Load it:
+         launchctl load ~/Library/LaunchAgents/com.amazontracker.daily.plist
+    4. Test immediately (don't wait for the schedule):
+         launchctl start com.amazontracker.daily
+    5. Watch:
+         tail -f <repo>/logs/run_*.log
+
+  Runs daily at 06:00 local time. Unload with:
+    launchctl unload ~/Library/LaunchAgents/com.amazontracker.daily.plist
+
+  NOTE: if the CSV (Selenium) step is used, the mini must have Chrome running
+  and logged into keepa.com. For a headless box, set SKIP_CSV=1 below and run
+  the CSV export interactively, or rely on the API path only.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.amazontracker.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/cagri/Desktop/amazon-tracker/scripts/daily_pipeline.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHON</key>
+        <string>/usr/bin/python3</string>
+        <!-- Uncomment for a headless box with no logged-in Chrome:
+        <key>SKIP_CSV</key>
+        <string>1</string>
+        -->
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/cagri/Desktop/amazon-tracker/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/cagri/Desktop/amazon-tracker/logs/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

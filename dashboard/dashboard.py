@@ -178,7 +178,7 @@ def get_conn():
         st.error(
             f"Database not found at `{DB_PATH}`. "
             "Run the Keepa exporter first:\n\n"
-            "`cd pipeline && python keepa_viewer_export.py --asins-file ../keepa_pipeline/data/asins.txt`"
+            "`cd pipeline && python keepa_viewer_export.py --asins-file ../data/asins.txt`"
         )
         st.stop()
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -186,8 +186,40 @@ def get_conn():
     return conn
 
 
+@st.cache_data(ttl=300)
 def query(sql: str, params=()) -> pd.DataFrame:
     return pd.read_sql_query(sql, get_conn(), params=params)
+
+
+@st.cache_data(ttl=300)
+def load_daily_sales(asin: str, days: int):
+    """Canonical daily units-sold series for an ASIN.
+
+    Single source of truth: prefer TRUE per-seller deltas
+    (`v_asin_daily_sales`); fall back to FBA-aggregate deltas
+    (`v_daily_sales`) only when the ASIN has no per-seller data yet.
+    Returns (DataFrame[Date, units_sold, units_restocked, sellers], source).
+    """
+    ps = query(
+        """SELECT sale_date AS Date, units_sold, units_restocked,
+                  selling_seller_count AS sellers
+           FROM v_asin_daily_sales
+           WHERE asin = ? AND sale_date >= date('now', ?)
+           ORDER BY sale_date""",
+        (asin, f"-{days} days"),
+    )
+    if not ps.empty:
+        return ps, "per-seller"
+    fb = query(
+        """SELECT snapshot_date AS Date, units_sold,
+                  0 AS units_restocked, NULL AS sellers
+           FROM v_daily_sales
+           WHERE asin = ? AND snapshot_date >= date('now', ?)
+             AND units_sold IS NOT NULL
+           ORDER BY snapshot_date""",
+        (asin, f"-{days} days"),
+    )
+    return fb, "fba-delta"
 
 
 def table_exists(name: str) -> bool:
@@ -237,305 +269,120 @@ st.divider()
 st.sidebar.header("Filters")
 view = st.sidebar.radio(
     "Choose a view",
-    ["📋 All products (today)", "🔎 Single product trend", "🎯 Replenishment"],
+    ["🔎 Single product trend", "🎯 Replenishment"],
     index=0,
-    help="• All products = today's snapshot of every ASIN.\n"
-         "• Single product = drill into one ASIN over time.\n"
+    help="• Single product = pick a brand + ASIN, see every trend + per-seller stock.\n"
          "• Replenishment = SHIP/HOLD/AVOID recommendation per ASIN.",
 )
 
 days = st.sidebar.slider(
     "Days of history to load",
-    min_value=1, max_value=90, value=30,
-    help="Affects trend charts and historical queries.",
+    min_value=7, max_value=90, value=90,
+    help="Affects trend charts. Storage is capped at 90 days for per-seller data.",
 )
 cutoff = (date.today() - timedelta(days=days)).isoformat()
 st.sidebar.caption(f"Database: `{DB_PATH}`")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# VIEW 1: ALL PRODUCTS — LATEST SNAPSHOT
-# ══════════════════════════════════════════════════════════════════════════
-if view == "📋 All products (today)":
-    st.markdown(
-        '<div style="display:flex;align-items:baseline;justify-content:space-between;'
-        'margin:0.2rem 0 0.4rem 0"><h2 style="margin:0;font-weight:800;letter-spacing:-0.01em">'
-        'All tracked products</h2><span style="opacity:0.55;font-size:0.85rem">'
-        f'Latest snapshot: <b>{query("SELECT MAX(snapshot_date) AS d FROM fct_keepa_daily").iloc[0]["d"]}</b>'
-        '</span></div>',
-        unsafe_allow_html=True,
-    )
+@st.cache_data(ttl=300)
+def _health_md() -> str:
+    import health_check
+    return health_check.format_markdown(health_check.run_checks(get_conn()))
 
-    latest_date = query(
-        "SELECT MAX(snapshot_date) AS d FROM fct_keepa_daily"
-    ).iloc[0]["d"]
 
-    # Top-line KPIs for the latest day
-    kpi = query(
-        """
-        SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN buy_box_seller IS NULL OR buy_box_seller = '-'
-                   OR buy_box_price IS NULL THEN 1 ELSE 0 END) AS oos,
-          AVG(sales_rank_current) AS avg_rank,
-          AVG(buy_box_price) AS avg_price,
-          AVG(oos_90d_pct) AS avg_oos
-        FROM fct_keepa_daily WHERE snapshot_date = ?
-        """,
-        (latest_date,),
-    ).iloc[0]
-
-    section_header("Catalog snapshot — KPIs")
-    # KPI row 1 (3 cards)
-    k1, k2, k3 = st.columns(3, gap="medium")
-    with k1.container(border=True):
-        st.metric(
-            "🚫 Out of stock right now",
-            f"{int(kpi['oos'])} / {int(kpi['total'])}",
-            help="Products with no current buy-box winner or no listed price.",
+with st.sidebar.expander("🩺 Pipeline health", expanded=False):
+    st.markdown(_health_md())
+    if table_exists("pipeline_runs"):
+        last_run = query(
+            """SELECT finished_at, status, csv_rows_today
+               FROM pipeline_runs WHERE status != 'failed'
+               ORDER BY run_id DESC LIMIT 1"""
         )
-    with k2.container(border=True):
-        st.metric(
-            "📈 Average BSR",
-            f"#{int(kpi['avg_rank']):,}" if pd.notna(kpi["avg_rank"]) else "—",
-            help="Best Sellers Rank — lower = sells more often. Averaged across products.",
-        )
-    with k3.container(border=True):
-        st.metric(
-            "💵 Average buy-box price",
-            f"${kpi['avg_price']:.2f}" if pd.notna(kpi["avg_price"]) else "—",
-            help="The price showing in Amazon's buy-box for sellers that have one.",
-        )
-
-    # KPI row 2 (3 cards)
-    k4, k5, k6 = st.columns(3, gap="medium")
-    with k4.container(border=True):
-        st.metric(
-            "📉 Avg 90-day OOS %",
-            f"{kpi['avg_oos']:.1f}%" if pd.notna(kpi["avg_oos"]) else "—",
-            help="How often, in the last 90 days, these products were out of stock.",
-        )
-    # Pull additional aggregates for the second row
-    extra = query(
-        """SELECT AVG(fba_offers) AS avg_fba, AVG(fbm_offers) AS avg_fbm,
-                  AVG(total_offers) AS avg_tot
-           FROM fct_keepa_daily WHERE snapshot_date = ?""",
-        (latest_date,),
-    ).iloc[0]
-    with k5.container(border=True):
-        st.metric(
-            "👥 Avg offers per ASIN",
-            f"{extra['avg_tot']:.1f}" if pd.notna(extra["avg_tot"]) else "—",
-            help="Average number of 3rd-party sellers per product.",
-        )
-    with k6.container(border=True):
-        st.metric(
-            "🚚 Avg FBA / FBM split",
-            f"{extra['avg_fba']:.1f} / {extra['avg_fbm']:.1f}"
-            if pd.notna(extra["avg_fba"]) and pd.notna(extra["avg_fbm"]) else "—",
-            help="Average FBA and FBM offer counts per ASIN.",
-        )
-
-    # ── Catalog inventory totals (NEW) ──
-    section_header("Catalog inventory & sellers")
-    totals = query(
-        """SELECT
-             SUM(fba_stock)     AS total_fba_stock,
-             SUM(buy_box_stock) AS total_bb_stock,
-             SUM(fba_offers)    AS total_fba_sellers,
-             SUM(fbm_offers)    AS total_fbm_sellers,
-             SUM(total_offers)  AS total_sellers
-           FROM fct_keepa_daily WHERE snapshot_date = ?""",
-        (latest_date,),
-    ).iloc[0]
-    # Sum of derived daily velocity across all ASINs with measurable velocity
-    daily_sold = query(
-        """SELECT SUM(units_sold_per_day) AS total_per_day,
-                  COUNT(*) AS n_asins
-           FROM v_daily_sales
-           WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM v_daily_sales)
-             AND units_sold_per_day IS NOT NULL"""
-    ).iloc[0]
-
-    i1, i2, i3 = st.columns(3, gap="medium")
-    with i1.container(border=True):
-        st.metric(
-            "📦 Total FBA stock",
-            f"{int(totals['total_fba_stock']):,}" if pd.notna(totals["total_fba_stock"]) else "—",
-            help="Aggregate FBA inventory across every tracked ASIN (sum of `fba_stock`).",
-        )
-    with i2.container(border=True):
-        st.metric(
-            "🏪 Total Buy-Box stock",
-            f"{int(totals['total_bb_stock']):,}" if pd.notna(totals["total_bb_stock"]) else "—",
-            help="Sum of inventory held by each ASIN's current buy-box-winning seller.",
-        )
-    with i3.container(border=True):
-        st.metric(
-            "⚡ Daily units sold (catalog)",
-            f"{daily_sold['total_per_day']:.0f}" if pd.notna(daily_sold["total_per_day"]) else "—",
-            help=(f"Sum of derived daily velocity across "
-                  f"{int(daily_sold['n_asins'] or 0)} ASINs with measurable sales today. "
-                  "From FBA-stock deltas in v_daily_sales — restocks can hide some sales."),
-        )
-
-    j1, j2, j3 = st.columns(3, gap="medium")
-    with j1.container(border=True):
-        st.metric(
-            "🚚 Total FBA sellers",
-            f"{int(totals['total_fba_sellers']):,}" if pd.notna(totals["total_fba_sellers"]) else "—",
-            help="Sum of FBA offer counts across all tracked ASINs.",
-        )
-    with j2.container(border=True):
-        st.metric(
-            "🏠 Total FBM sellers",
-            f"{int(totals['total_fbm_sellers']):,}" if pd.notna(totals["total_fbm_sellers"]) else "—",
-            help="Sum of FBM (Fulfilled by Merchant) offer counts across all tracked ASINs.",
-        )
-    with j3.container(border=True):
-        st.metric(
-            "👥 Total active sellers",
-            f"{int(totals['total_sellers']):,}" if pd.notna(totals["total_sellers"]) else "—",
-            help="FBA + FBM combined, summed across catalog.",
-        )
-
-    section_header("Product list")
-
-    # Friendlier column names + reasonable column order
-    table = query(
-        """
-        SELECT
-            d.image_url           AS "Image",
-            k.asin                AS "ASIN",
-            d.title               AS "Title",
-            d.brand               AS "Brand",
-            k.sales_rank_current  AS "BSR (now)",
-            k.sales_rank_30d_avg  AS "BSR (30-day avg)",
-            k.buy_box_price       AS "Buy-Box $",
-            k.fba_offers          AS "FBA sellers",
-            k.fbm_offers          AS "FBM sellers",
-            k.total_offers        AS "Total sellers",
-            k.fba_stock           AS "FBA stock",
-            k.buy_box_stock       AS "Buy-Box stock",
-            ROUND(v.units_sold_per_day, 2) AS "Daily sold",
-            k.buy_box_seller      AS "Buy-Box Seller",
-            k.oos_90d_pct         AS "90-day OOS %",
-            k.monthly_sold        AS "Monthly Sold (est)",
-            k.pct_top_seller_30d  AS "% Top Seller (30d)",
-            k.pct_top_seller_90d  AS "% Top Seller (90d)",
-            k.is_fba_pct          AS "Buy-Box is FBA?"
-        FROM fct_keepa_daily k
-        LEFT JOIN dim_product d ON d.asin = k.asin
-        LEFT JOIN v_daily_sales v
-               ON v.asin = k.asin
-              AND v.snapshot_date = k.snapshot_date
-        WHERE k.snapshot_date = ?
-        ORDER BY k.sales_rank_current
-        """,
-        (latest_date,),
-    )
-    # Upscale thumbnail URLs (Keepa returns tiny ~75px; we want ~120px for the table)
-    table["Image"] = table["Image"].apply(lambda u: resize_amazon_image(u, size=160))
-
-    st.dataframe(
-        table,
-        use_container_width=True,
-        hide_index=True,
-        height=540,
-        column_config={
-            "Image": st.column_config.ImageColumn("📷", width="small",
-                                                  help="Product photo from Keepa"),
-            "ASIN": st.column_config.TextColumn(width="small"),
-            "Title": st.column_config.TextColumn(width="large"),
-            "Buy-Box $": st.column_config.NumberColumn(format="$%.2f"),
-            "BSR (now)": st.column_config.NumberColumn(format="%d"),
-            "BSR (30-day avg)": st.column_config.NumberColumn(format="%d"),
-            "FBA sellers": st.column_config.NumberColumn(
-                format="%d", width="small",
-                help="Count of sellers fulfilling via Amazon FBA."),
-            "FBM sellers": st.column_config.NumberColumn(
-                format="%d", width="small",
-                help="Count of sellers fulfilling themselves (FBM)."),
-            "Total sellers": st.column_config.NumberColumn(format="%d", width="small"),
-            "FBA stock": st.column_config.NumberColumn(
-                format="%d", width="small",
-                help="Aggregate FBA inventory across all FBA sellers."),
-            "Buy-Box stock": st.column_config.NumberColumn(
-                format="%d", width="small",
-                help="Inventory of just the current buy-box-winning seller."),
-            "Daily sold": st.column_config.NumberColumn(
-                format="%.2f", width="small",
-                help=("Derived from yesterday→today FBA stock drop. "
-                      "Blank = no measurable change (restock or no data yet).")),
-        },
-    )
-
-    st.divider()
-
-    # ── Charts row: BSR distribution + Daily collection ──
-    section_header("Trends across catalog")
-    bsr_data = query(
-        """SELECT sales_rank_current FROM fct_keepa_daily
-           WHERE snapshot_date = ? AND sales_rank_current IS NOT NULL""",
-        (latest_date,),
-    )
-    cov = query(
-        """SELECT snapshot_date AS Date, COUNT(*) AS Products
-           FROM fct_keepa_daily WHERE snapshot_date >= ?
-           GROUP BY snapshot_date ORDER BY snapshot_date""",
-        (cutoff,),
-    )
-    g1, g2 = st.columns(2, gap="medium")
-    with g1.container(border=True):
-        st.markdown('<div class="chart-title">📊 BSR distribution</div>', unsafe_allow_html=True)
-        st.markdown('<div class="chart-caption">How your tracked products are ranked on Amazon. Lower (left) = sells more often.</div>', unsafe_allow_html=True)
-        if not bsr_data.empty:
-            fig = px.histogram(bsr_data, x="sales_rank_current", nbins=40, color_discrete_sequence=["#6366f1"])
-            fig.update_layout(height=280, showlegend=False, bargap=0.05,
-                              margin=dict(l=8, r=8, t=8, b=8),
-                              plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-            fig.update_xaxes(title_text="BSR", gridcolor="rgba(127,127,127,0.08)")
-            fig.update_yaxes(title_text="Products", gridcolor="rgba(127,127,127,0.14)")
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        if not last_run.empty:
+            r = last_run.iloc[0]
+            st.caption(f"Last run: {r['finished_at']} · {r['status']} · "
+                       f"{int(r['csv_rows_today'] or 0)} CSV rows today")
         else:
-            st.info("No BSR data yet.")
-    with g2.container(border=True):
-        st.markdown('<div class="chart-title">🗓 Daily collection</div>', unsafe_allow_html=True)
-        st.markdown('<div class="chart-caption">Products captured each day. Gaps mean the exporter didn\'t run.</div>', unsafe_allow_html=True)
-        if len(cov) >= 1:
-            fig = px.bar(cov, x="Date", y="Products", color_discrete_sequence=["#10b981"])
-            fig.update_layout(height=280, margin=dict(l=8, r=8, t=8, b=8),
-                              plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-            fig.update_xaxes(title_text=None, gridcolor="rgba(127,127,127,0.08)")
-            fig.update_yaxes(gridcolor="rgba(127,127,127,0.14)")
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-        else:
-            st.info("Run the exporter on more days to see this chart.")
+            st.caption("No successful pipeline run logged yet.")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# VIEW 2: SINGLE-PRODUCT TREND
+# VIEW 1: SINGLE-PRODUCT TREND  (default — main analytical page)
 # ══════════════════════════════════════════════════════════════════════════
-elif view == "🔎 Single product trend":
+if view == "🔎 Single product trend":
     st.markdown(
         "<div style='display:flex;align-items:baseline;justify-content:space-between;"
         "margin:0.2rem 0 0.6rem'><h2 style='margin:0;font-weight:800;letter-spacing:-0.01em'>"
         "Single product trend</h2><span style='opacity:0.5;font-size:0.8rem'>"
-        "Pick an ASIN in the sidebar to drill in</span></div>",
+        "Filter by brand → ASIN; see BSR, stock, prices, sellers, daily sales</span></div>",
         unsafe_allow_html=True,
     )
 
-    options_df = query(
-        """SELECT DISTINCT k.asin, COALESCE(d.title, k.asin) AS title
-           FROM fct_keepa_daily k
-           LEFT JOIN dim_product d ON d.asin = k.asin
-           ORDER BY title"""
+    # ── Brand filter (NEW) — cascades into ASIN dropdown ──
+    brands = query(
+        """SELECT DISTINCT COALESCE(d.brand, '(no brand)') AS brand,
+                  COUNT(DISTINCT d.asin) AS asin_count
+           FROM dim_product d
+           JOIN fct_keepa_daily k ON k.asin = d.asin
+           GROUP BY brand
+           ORDER BY brand"""
     )
-    options = {
-        f"{row['asin']} — {(row['title'] or '')[:70]}": row["asin"]
-        for _, row in options_df.iterrows()
-    }
-    label = st.sidebar.selectbox("Pick a product", list(options.keys()))
+    brand_options = ["🌐 All brands"] + [
+        f"{row['brand']}  ({row['asin_count']})" for _, row in brands.iterrows()
+    ]
+    picked_brand = st.sidebar.selectbox(
+        "Brand", brand_options,
+        help="Filter the ASIN dropdown by brand. 'All brands' = unfiltered.",
+    )
+
+    # ── ASIN selector — filtered by brand ──
+    # Also LEFT JOIN seller_count so we can show 🏪 marker + sort ASINs WITH
+    # per-seller data FIRST in the dropdown.
+    base_sql = """
+        SELECT k.asin,
+               COALESCE(d.title, k.asin) AS title,
+               COALESCE(sc.sellers, 0)   AS sellers
+        FROM (SELECT DISTINCT asin FROM fct_keepa_daily) k
+        LEFT JOIN dim_product d ON d.asin = k.asin
+        LEFT JOIN (
+            SELECT asin, COUNT(DISTINCT seller_id) AS sellers
+            FROM fct_keepa_seller_history
+            WHERE stock IS NOT NULL
+            GROUP BY asin
+        ) sc ON sc.asin = k.asin
+        {where}
+        ORDER BY sellers DESC, title
+    """
+    if picked_brand.startswith("🌐"):
+        options_df = query(base_sql.format(where=""))
+    else:
+        brand_name = picked_brand.rsplit("  (", 1)[0]
+        options_df = query(
+            base_sql.format(where="WHERE COALESCE(d.brand, '(no brand)') = ?"),
+            (brand_name,),
+        )
+
+    if options_df.empty:
+        st.sidebar.warning("No ASINs match this brand.")
+        st.stop()
+
+    # Label format:  🏪137  B00RNFPU3W — title…   (when per-seller data exists)
+    #                 ⏳    B0XXXXXXXX — title…   (when not yet fetched)
+    def _label_for(row):
+        if row["sellers"] > 0:
+            tag = f"🏪 {int(row['sellers']):>3}"
+        else:
+            tag = "⏳    "
+        return f"{tag}  {row['asin']} — {(row['title'] or '')[:55]}"
+
+    options = {_label_for(r): r["asin"] for _, r in options_df.iterrows()}
+    n_with_seller = (options_df["sellers"] > 0).sum()
+    label = st.sidebar.selectbox(
+        f"ASIN ({len(options)} total · 🏪 {n_with_seller} with seller data)",
+        list(options.keys()),
+        help="🏪 N = N sellers tracked.  ⏳ = not yet API-fetched.  "
+             "Sellers-tracked ASINs appear first.",
+    )
     asin = options[label]
 
     prod = query("SELECT * FROM dim_product WHERE asin = ?", (asin,))
@@ -890,19 +737,19 @@ elif view == "🔎 Single product trend":
     )
     chart_card(
         d2,
-        title="📊 Monthly sales (Keepa)",
-        caption="Keepa's estimate of units sold over the last 30 days. Only available when Amazon publishes it on the listing.",
+        title="📊 Monthly sales — Keepa estimate",
+        caption="Keepa's <i>own estimate</i> of units sold in 30 days (only when Amazon publishes it). For the measured figure, see the <b>Daily units sold</b> section below.",
         traces=[{"col": "monthly_sold", "name": "Units / month", "color": "#a855f7"}],
         y_title="Units / month",
         fill=True, single_color="rgba(168,85,247,0.13)",
     )
-    # Daily velocity (derived)
+    # Daily velocity (Keepa estimate ÷ 30 — distinct from the measured section below)
     if trend["monthly_sold"].notna().any():
         velocity = trend.copy()
         velocity["daily_velocity"] = velocity["monthly_sold"] / 30.0
         with d3.container(border=True):
-            st.markdown('<div class="chart-title">⚡ Daily sales velocity</div>', unsafe_allow_html=True)
-            st.markdown('<div class="chart-caption">Monthly Sold ÷ 30. Useful for inventory planning and run-rate analysis.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="chart-title">⚡ Daily velocity — Keepa estimate</div>', unsafe_allow_html=True)
+            st.markdown('<div class="chart-caption">Keepa Monthly Sold ÷ 30. An estimate — compare against the measured <b>Daily units sold</b> section below.</div>', unsafe_allow_html=True)
             fig = go.Figure(go.Scatter(
                 x=velocity["Date"], y=velocity["daily_velocity"],
                 mode="lines+markers", line=dict(color="#eab308", width=2.5, shape="spline", smoothing=0.6),
@@ -915,6 +762,310 @@ elif view == "🔎 Single product trend":
         with d3.container(border=True):
             st.markdown('<div class="chart-title">⚡ Daily sales velocity</div>', unsafe_allow_html=True)
             st.markdown('<div class="chart-caption">Requires Keepa\'s Monthly Sold field — Amazon isn\'t showing it for this ASIN.</div>', unsafe_allow_html=True)
+
+    # ══ DAILY UNITS SOLD (canonical, always shown) ════════════════════
+    # Single source of truth: prefer true per-seller deltas
+    # (v_asin_daily_sales), fall back to FBA-aggregate deltas (v_daily_sales).
+    has_seller_data = table_exists("fct_keepa_seller_history") and query(
+        "SELECT COUNT(*) AS n FROM fct_keepa_seller_history WHERE asin = ?",
+        (asin,),
+    ).iloc[0]["n"] > 0
+
+    section_header("Daily units sold")
+    sales_df, sales_source = load_daily_sales(asin, days)
+    is_ps = sales_source == "per-seller"
+    if is_ps:
+        st.caption(
+            "**Source: per-seller** — computed from each seller's stock drops "
+            "(restocks excluded). This is the accurate figure, not an estimate."
+        )
+    else:
+        st.caption(
+            "**Source: FBA-delta** — derived from day-over-day drops in the FBA "
+            "aggregate stock. No per-seller data for this ASIN yet, so this is a "
+            "lower-bound estimate (restocks can mask sales)."
+        )
+
+    if sales_df.empty:
+        st.info(f"No sales signal in the last {days} days for this ASIN.")
+    else:
+        sales_df["Date"] = pd.to_datetime(sales_df["Date"])
+        total_sold = int(sales_df["units_sold"].fillna(0).sum())
+        active_days = int((sales_df["units_sold"].fillna(0) > 0).sum())
+        avg_per_active = total_sold / active_days if active_days else 0
+        # KPI strip — restock KPI only meaningful for the per-seller source
+        kcols = st.columns(4 if is_ps else 3, gap="medium")
+        with kcols[0].container(border=True):
+            st.metric(f"⚡ Total sold ({days}d)", f"{total_sold:,}",
+                      help="Units sold across this ASIN in the window.")
+        idx = 1
+        if is_ps:
+            total_restocked = int(sales_df["units_restocked"].fillna(0).sum())
+            with kcols[idx].container(border=True):
+                st.metric(f"📦 Total restocked ({days}d)", f"{total_restocked:,}",
+                          help="Sum of every seller's stock increases (restocks).")
+            idx += 1
+        with kcols[idx].container(border=True):
+            st.metric("📅 Days with sales", f"{active_days}",
+                      help="How many days had at least 1 unit sold.")
+        idx += 1
+        with kcols[idx].container(border=True):
+            st.metric("📊 Avg sold per active day", f"{avg_per_active:.1f}",
+                      help="Total sold ÷ days that had any sales.")
+
+        with st.container(border=True):
+            title = ("📈 Daily units sold (bars) vs restocked (line)" if is_ps
+                     else "📈 Daily units sold (FBA-delta estimate)")
+            st.markdown(f'<div class="chart-title">{title}</div>', unsafe_allow_html=True)
+            cap = ("Green bars = units sold per day. Orange line = restocks "
+                   "(Keepa observations of seller stock going UP)." if is_ps else
+                   "Green bars = estimated units sold per day from FBA stock drops.")
+            st.markdown(f'<div class="chart-caption">{cap}</div>', unsafe_allow_html=True)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=sales_df["Date"], y=sales_df["units_sold"],
+                name="Sold", marker_color="#10b981",
+            ))
+            if is_ps and sales_df["units_restocked"].fillna(0).sum() > 0:
+                fig.add_trace(go.Scatter(
+                    x=sales_df["Date"], y=sales_df["units_restocked"],
+                    name="Restocked", mode="lines+markers",
+                    line=dict(color="#f97316", width=2, dash="dot"),
+                    marker=dict(size=5),
+                ))
+            fig.update_layout(
+                height=320, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=8, r=8, t=8, b=8), barmode="group",
+                legend=dict(orientation="h", yanchor="bottom", y=-0.25,
+                            xanchor="center", x=0.5, bgcolor="rgba(0,0,0,0)"),
+                hovermode="x unified",
+            )
+            fig.update_xaxes(title=None, gridcolor="rgba(127,127,127,0.08)")
+            fig.update_yaxes(title="Units", gridcolor="rgba(127,127,127,0.14)")
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+    if has_seller_data:
+        section_header("Per-seller inventory")
+
+        # Optional seller filter (defaults to all)
+        sellers_for_asin = query(
+            """SELECT h.seller_id,
+                      COALESCE(s.seller_name, '(name not fetched)') AS name,
+                      MAX(h.is_fba)   AS is_fba,
+                      MAX(s.is_amazon) AS is_amazon,
+                      COUNT(*) AS events
+               FROM fct_keepa_seller_history h
+               LEFT JOIN dim_keepa_seller s ON s.seller_id = h.seller_id
+               WHERE h.asin = ? AND h.stock IS NOT NULL
+               GROUP BY h.seller_id
+               ORDER BY events DESC""",
+            (asin,),
+        )
+
+        seller_options = {"📊 All sellers (one line each)": None}
+        for _, sr in sellers_for_asin.iterrows():
+            flag = "🛒" if sr["is_amazon"] else ("🚚" if sr["is_fba"] else "🏠")
+            lbl = f"{flag}  {sr['name'][:30]}  ({sr['seller_id']})"
+            seller_options[lbl] = sr["seller_id"]
+
+        picked_seller_label = st.selectbox(
+            f"Seller filter — {len(sellers_for_asin)} sellers for this ASIN",
+            options=list(seller_options.keys()),
+            key=f"single_prod_seller_{asin}",
+            help="Default = each seller as its own colored line. "
+                 "Pick a seller to drill into just their stock + price.",
+        )
+        sel_seller = seller_options[picked_seller_label]
+
+        if sel_seller is None:
+            # ── Multi-line chart: one line per seller ──
+            with st.container(border=True):
+                st.markdown(
+                    '<div class="chart-title">📦 Stock over time — every seller</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    '<div class="chart-caption">Each color = one seller. Hover any line to see who owns the stock.</div>',
+                    unsafe_allow_html=True,
+                )
+                history = query(
+                    """SELECT h.change_time AS Date,
+                              h.seller_id,
+                              COALESCE(s.seller_name, h.seller_id) AS name,
+                              h.stock
+                       FROM fct_keepa_seller_history h
+                       LEFT JOIN dim_keepa_seller s ON s.seller_id = h.seller_id
+                       WHERE h.asin = ? AND h.stock IS NOT NULL
+                         AND h.change_time >= datetime('now', ?)
+                       ORDER BY h.change_time""",
+                    (asin, f"-{days} days"),
+                )
+                if history.empty:
+                    st.info(f"No stock events in the last {days} days. Try a wider window in the sidebar.")
+                else:
+                    history["legend"] = history.apply(
+                        lambda r: f"{(r['name'] or '')[:22]} ({r['seller_id']})", axis=1
+                    )
+                    fig = px.line(
+                        history, x="Date", y="stock", color="legend", markers=True,
+                        labels={"stock": "Stock (units)", "legend": "Seller"},
+                    )
+                    fig.update_traces(line=dict(width=2, shape="hv"), marker=dict(size=4))
+                    fig.update_layout(
+                        height=440, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
+                        margin=dict(l=8, r=8, t=8, b=8),
+                        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left",
+                                    x=1.02, bgcolor="rgba(0,0,0,0)", font=dict(size=10)),
+                    )
+                    fig.update_xaxes(gridcolor="rgba(127,127,127,0.08)")
+                    fig.update_yaxes(gridcolor="rgba(127,127,127,0.14)")
+                    st.plotly_chart(fig, use_container_width=True)
+
+            # Daily TOTAL stock across all sellers
+            with st.container(border=True):
+                st.markdown('<div class="chart-title">📊 Daily total stock (all sellers combined)</div>',
+                            unsafe_allow_html=True)
+                st.markdown('<div class="chart-caption">Sum of latest stock per seller per day.</div>',
+                            unsafe_allow_html=True)
+                daily = query(
+                    """WITH per_day_seller AS (
+                          SELECT DATE(change_time) AS day, seller_id, stock,
+                                 ROW_NUMBER() OVER (PARTITION BY DATE(change_time), seller_id
+                                                    ORDER BY change_time DESC) AS rn
+                          FROM fct_keepa_seller_history
+                          WHERE asin = ? AND stock IS NOT NULL
+                            AND change_time >= datetime('now', ?)
+                       )
+                       SELECT day AS Date, SUM(stock) AS total_stock,
+                              COUNT(seller_id) AS sellers
+                       FROM per_day_seller WHERE rn = 1
+                       GROUP BY day ORDER BY day""",
+                    (asin, f"-{days} days"),
+                )
+                if not daily.empty:
+                    fig = px.area(daily, x="Date", y="total_stock",
+                                  hover_data={"sellers": True},
+                                  color_discrete_sequence=["#6366f1"])
+                    fig.update_traces(line=dict(width=2.5))
+                    fig.update_layout(height=260, plot_bgcolor="rgba(0,0,0,0)",
+                                      paper_bgcolor="rgba(0,0,0,0)", showlegend=False,
+                                      margin=dict(l=8, r=8, t=8, b=8))
+                    fig.update_xaxes(title=None, gridcolor="rgba(127,127,127,0.08)")
+                    fig.update_yaxes(title="Total units", gridcolor="rgba(127,127,127,0.14)")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No data in window.")
+        else:
+            # ── Single seller drill ──
+            single = query(
+                """SELECT change_time AS Date, stock, price_cents/100.0 AS price_usd
+                   FROM fct_keepa_seller_history
+                   WHERE asin = ? AND seller_id = ?
+                     AND change_time >= datetime('now', ?)
+                   ORDER BY change_time""",
+                (asin, sel_seller, f"-{days} days"),
+            )
+            cs = st.columns(2, gap="medium")
+            with cs[0].container(border=True):
+                st.markdown('<div class="chart-title">📦 Stock</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="chart-caption">Every stock change for <code>{sel_seller}</code>.</div>',
+                            unsafe_allow_html=True)
+                stk = single[single["stock"].notna()]
+                if stk.empty:
+                    st.info("No stock data.")
+                else:
+                    fig = px.line(stk, x="Date", y="stock", markers=True,
+                                  color_discrete_sequence=["#10b981"])
+                    fig.update_traces(line=dict(width=2.5, shape="hv"))
+                    fig.update_layout(height=320, plot_bgcolor="rgba(0,0,0,0)",
+                                      paper_bgcolor="rgba(0,0,0,0)",
+                                      margin=dict(l=8, r=8, t=8, b=8))
+                    fig.update_xaxes(title=None, gridcolor="rgba(127,127,127,0.08)")
+                    fig.update_yaxes(title="Stock", gridcolor="rgba(127,127,127,0.14)")
+                    st.plotly_chart(fig, use_container_width=True)
+            with cs[1].container(border=True):
+                st.markdown('<div class="chart-title">💵 Price</div>', unsafe_allow_html=True)
+                st.markdown('<div class="chart-caption">Every price change this seller has shown.</div>',
+                            unsafe_allow_html=True)
+                pr = single[single["price_usd"].notna()]
+                if pr.empty:
+                    st.info("No price data.")
+                else:
+                    fig = px.line(pr, x="Date", y="price_usd", markers=True,
+                                  color_discrete_sequence=["#6366f1"])
+                    fig.update_traces(line=dict(width=2.5, shape="hv"))
+                    fig.update_layout(height=320, plot_bgcolor="rgba(0,0,0,0)",
+                                      paper_bgcolor="rgba(0,0,0,0)",
+                                      margin=dict(l=8, r=8, t=8, b=8))
+                    fig.update_xaxes(title=None, gridcolor="rgba(127,127,127,0.08)")
+                    fig.update_yaxes(title="Price ($)", gridcolor="rgba(127,127,127,0.14)")
+                    st.plotly_chart(fig, use_container_width=True)
+
+            # Quick KPIs for this seller
+            sold = query(
+                """WITH ev AS (
+                      SELECT change_time, stock,
+                             LAG(stock) OVER (ORDER BY change_time) AS prev_stock
+                      FROM fct_keepa_seller_history
+                      WHERE asin = ? AND seller_id = ? AND stock IS NOT NULL
+                        AND change_time >= datetime('now', ?)
+                   )
+                   SELECT SUM(CASE WHEN prev_stock > stock THEN prev_stock - stock ELSE 0 END) AS sold,
+                          SUM(CASE WHEN prev_stock < stock THEN stock - prev_stock ELSE 0 END) AS restocked,
+                          COUNT(*) AS observations
+                   FROM ev""",
+                (asin, sel_seller, f"-{days} days"),
+            ).iloc[0]
+            m1, m2, m3 = st.columns(3, gap="medium")
+            with m1.container(border=True):
+                st.metric(f"⚡ Units sold ({days}d)", f"{int(sold['sold'] or 0):,}",
+                          help="Sum of stock decreases — 'stock down = sold' logic.")
+            with m2.container(border=True):
+                st.metric(f"📦 Units restocked ({days}d)", f"{int(sold['restocked'] or 0):,}")
+            with m3.container(border=True):
+                st.metric("👁 Observations", f"{int(sold['observations'] or 0):,}")
+
+        # Sellers table — always shown
+        section_header("Current sellers for this ASIN")
+        st.caption("Most recent stock observation per seller. Click any column header to sort.")
+        latest_sellers = query(
+            """WITH latest AS (
+                  SELECT seller_id, MAX(change_time) AS last_t
+                  FROM fct_keepa_seller_history
+                  WHERE asin = ? AND stock IS NOT NULL
+                  GROUP BY seller_id
+               )
+               SELECT h.seller_id              AS "Seller ID",
+                      COALESCE(s.seller_name, '(name not fetched)') AS "Name",
+                      CASE WHEN s.is_amazon = 1 THEN '🛒 Amazon'
+                           WHEN h.is_fba = 1    THEN '🚚 FBA'
+                           ELSE                       '🏠 FBM' END AS "Channel",
+                      h.stock                  AS "Stock",
+                      h.change_time            AS "Last seen"
+               FROM fct_keepa_seller_history h
+               JOIN latest l
+                 ON l.seller_id = h.seller_id AND l.last_t = h.change_time
+               LEFT JOIN dim_keepa_seller s ON s.seller_id = h.seller_id
+               WHERE h.asin = ?
+               ORDER BY h.stock DESC""",
+            (asin, asin),
+        )
+        st.dataframe(
+            latest_sellers, use_container_width=True, hide_index=True, height=380,
+            column_config={
+                "Seller ID": st.column_config.TextColumn(width="small"),
+                "Name": st.column_config.TextColumn(width="medium"),
+                "Channel": st.column_config.TextColumn(width="small"),
+                "Stock": st.column_config.NumberColumn(format="%d", width="small"),
+            },
+        )
+    else:
+        section_header("Per-seller inventory")
+        st.info(
+            "No per-seller data for this ASIN yet. "
+            "Run `cd pipeline && python keepa_api_offers.py --tick` to fetch it from Keepa API. "
+            "Each tick processes ~100 ASINs."
+        )
 
     # ══ Raw history (collapsible) ═════════════════════════════════════
     section_header("Underlying data")
@@ -1381,13 +1532,13 @@ else:
     # ── Methodology expander ──
     with st.expander("ℹ️ How recommendations are computed", expanded=False):
         st.markdown(f"""
-**Inputs per ASIN (from `fct_keepa_daily` and `v_daily_sales`):**
+**Inputs per ASIN (from `fct_keepa_daily`, `v_asin_daily_sales`, `v_daily_sales`):**
 - Current BSR, buy-box price, FBA stock, FBA/FBM offers, top-seller share
-- **Velocity (units/day)** — averaged over the last **{th.velocity_window_days} days**.
-  Source priority:
-  1. **FBA-delta**: derived from day-over-day drops in `fba_stock` (`v_daily_sales` view).
-     When stock increases between snapshots, we assume a restock and skip that interval.
-  2. **Keepa monthly**: fallback, uses Keepa's "Monthly Sold" ÷ 30 when no FBA-delta available.
+- **Velocity (units/day)** — measured over the last **{th.velocity_window_days} days**.
+  Source priority (first available wins):
+  1. **Per-seller** (canonical): true units sold from each seller's stock drops (`v_asin_daily_sales`). Restocks excluded.
+  2. **FBA-delta**: day-over-day drops in aggregate `fba_stock` (`v_daily_sales`). Used only when no per-seller data exists yet for the ASIN.
+  3. **Keepa monthly**: last-resort fallback — Keepa's "Monthly Sold" ÷ 30.
 - **Days of supply** = `fba_stock ÷ velocity`
 
 **Decision tree (in order):**
@@ -1407,5 +1558,7 @@ With target = **{th.target_days_of_supply}** days. *(Assumes unlimited warehouse
 **Limitations today:**
 - Only **{len(recs[recs['recommendation'] != 'WATCH']):,} of {len(recs):,} ASINs** have enough data for a confident call (rest are WATCH). This improves automatically as you run the exporter more days.
 - We can't see FBM stock (Keepa doesn't expose it).
-- "Sold today" is **derived from FBA stock drops** — restocks that happen between snapshots are invisible to us, so velocity may be slightly understated.
+- For ASINs without per-seller data yet, "sold" falls back to **FBA stock drops** — restocks between snapshots are invisible, so velocity may be slightly understated. This resolves automatically as the per-seller backfill reaches the ASIN.
 """)
+
+

@@ -1,14 +1,13 @@
 """
 Shared database utilities for Amazon Tracker.
-Imported by both browser_collector.py and keepa_api_collector.py.
+Imported by keepa_csv_importer.py (get_conn, init_db, upsert_product).
 """
 
 import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH        = os.getenv("DB_PATH", "amazon_tracker.db")
-RETENTION_DAYS = 10
+DB_PATH = os.getenv("DB_PATH", "amazon_tracker.db")
 
 
 def get_conn() -> sqlite3.Connection:
@@ -42,11 +41,3 @@ def upsert_product(conn, asin, title=None, brand=None,
             variation_color = COALESCE(excluded.variation_color, variation_color),
             image_url       = COALESCE(excluded.image_url, image_url)
     """, (asin, parent_asin, title, brand, variation_size, variation_color, image_url))
-
-
-def purge_old_snapshots(conn):
-    conn.execute(f"""
-        DELETE FROM fct_asin_daily
-        WHERE snapshot_date < date('now', '-{RETENTION_DAYS} days')
-    """)
-    conn.commit()

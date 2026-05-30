@@ -3,6 +3,15 @@
 -- dim_product  — static product info (one row per child ASIN)
 -- fct_asin_daily — daily snapshot per ASIN (fact table, append-only)
 -- ============================================================
+--
+-- CONTRACT: this file is SAFE TO RE-RUN at any time.
+--   * All CREATE TABLE statements use `IF NOT EXISTS` (never drop data).
+--   * All views are `DROP VIEW IF EXISTS` then `CREATE VIEW` (always
+--     refreshed to the latest definition — views hold no data).
+--   * Applied via `db.init_db()` or `sqlite3 amazon_tracker.db < schema.sql`.
+-- If you add a MATERIALIZED table that replaces a view, update db.init_db()
+-- and document the migration here — re-running must stay non-destructive.
+-- ============================================================
 
 -- dim_product: one row per tracked child ASIN
 CREATE TABLE IF NOT EXISTS dim_product (
@@ -112,6 +121,64 @@ CREATE TABLE IF NOT EXISTS asin_api_state (
     error_msg       TEXT,
     offer_count     INTEGER          -- live offers seen on last fetch
 );
+
+-- Pipeline run log: one row per orchestrated daily run (written by
+-- scripts/daily_pipeline.sh). Drives the dashboard's "last run" indicator
+-- and gives a quick audit trail of what ran when.
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      DATETIME NOT NULL,
+    finished_at     DATETIME,
+    status          TEXT,            -- 'success' | 'partial' | 'failed'
+    csv_rows_today  INTEGER,         -- fct_keepa_daily rows for today's date
+    seller_events   INTEGER,         -- total rows in fct_keepa_seller_history
+    notes           TEXT
+);
+
+-- ────────────────────────────────────────────────────────────────────────
+-- v_asin_daily_sales: TRUE daily units sold per ASIN, computed from
+-- per-seller stock changes using the spec:
+--   * Seller's stock decreased  → units_sold = (prev_stock - new_stock)
+--   * Seller's stock increased  → restock, ignored (returns 0)
+--   * Brand-new seller (no prior event) → excluded (first observation)
+-- Summed across all sellers for each (asin, change_date).
+-- ────────────────────────────────────────────────────────────────────────
+DROP VIEW IF EXISTS v_asin_daily_sales;
+CREATE VIEW v_asin_daily_sales AS
+WITH events AS (
+    SELECT
+        asin,
+        seller_id,
+        DATE(change_time) AS sale_date,
+        stock,
+        LAG(stock) OVER (PARTITION BY asin, seller_id ORDER BY change_time) AS prev_stock
+    FROM fct_keepa_seller_history
+    WHERE stock IS NOT NULL
+),
+per_seller_sales AS (
+    SELECT
+        asin,
+        seller_id,
+        sale_date,
+        SUM(CASE WHEN prev_stock IS NOT NULL AND prev_stock > stock
+                 THEN prev_stock - stock
+                 ELSE 0
+            END) AS units_sold,
+        SUM(CASE WHEN prev_stock IS NOT NULL AND stock > prev_stock
+                 THEN stock - prev_stock
+                 ELSE 0
+            END) AS units_restocked
+    FROM events
+    GROUP BY asin, seller_id, sale_date
+)
+SELECT
+    asin,
+    sale_date,
+    SUM(units_sold)        AS units_sold,
+    SUM(units_restocked)   AS units_restocked,
+    COUNT(DISTINCT CASE WHEN units_sold > 0 THEN seller_id END) AS selling_seller_count
+FROM per_seller_sales
+GROUP BY asin, sale_date;
 
 -- v_daily_sales: derived per-ASIN per-day units sold from FBA stock deltas.
 -- When today's stock > yesterday's, a restock happened — we can't measure

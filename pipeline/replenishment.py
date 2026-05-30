@@ -87,7 +87,26 @@ def compute(conn: sqlite3.Connection, thresholds: Thresholds | None = None) -> p
     if latest.empty:
         return latest
 
-    # 2. Velocity over the last N days (avg of non-null units_sold_per_day)
+    # 2. Velocity over the last N days — TWO sources:
+    #   (a) v_asin_daily_sales: TRUE per-seller-derived sales (preferred)
+    #   (b) v_daily_sales: FBA-stock-delta fallback (aggregate)
+    # Per-seller wins whenever the ASIN has any rows in the window.
+    vel_perseller = pd.read_sql_query(
+        """
+        SELECT
+            asin,
+            SUM(units_sold) * 1.0 / ?           AS velocity_perseller,
+            SUM(units_sold)                     AS units_sold_perseller_total,
+            COUNT(DISTINCT sale_date)           AS perseller_measured_days
+        FROM v_asin_daily_sales
+        WHERE sale_date >= date('now', ?)
+          AND units_sold > 0
+        GROUP BY asin
+        """,
+        conn,
+        params=(th.velocity_window_days, f"-{th.velocity_window_days} days"),
+    )
+
     vel = pd.read_sql_query(
         """
         SELECT
@@ -135,13 +154,28 @@ def compute(conn: sqlite3.Connection, thresholds: Thresholds | None = None) -> p
         params=(f"-{th.velocity_window_days} days",),
     )
 
-    df = latest.merge(vel, on="asin", how="left").merge(trend, on="asin", how="left")
+    df = (latest
+          .merge(vel_perseller, on="asin", how="left")
+          .merge(vel, on="asin", how="left")
+          .merge(trend, on="asin", how="left"))
 
-    # Fallback velocity from Keepa Monthly Sold if we lack derived data
+    # Velocity priority: per-seller (truest) → FBA-delta → Keepa monthly fallback
     df["velocity_fallback"] = df["monthly_sold_num"] / 30.0
-    df["velocity_used"] = df["velocity_avg"].fillna(df["velocity_fallback"])
-    df["velocity_source"] = df["velocity_avg"].notna().map({True: "FBA-delta", False: "Keepa monthly"})
-    df.loc[df["velocity_used"].isna(), "velocity_source"] = "—"
+    df["velocity_used"] = (
+        df["velocity_perseller"]
+          .fillna(df["velocity_avg"])
+          .fillna(df["velocity_fallback"])
+    )
+
+    def _src(r):
+        if pd.notna(r["velocity_perseller"]):
+            return "Per-seller"
+        if pd.notna(r["velocity_avg"]):
+            return "FBA-delta"
+        if pd.notna(r["velocity_fallback"]):
+            return "Keepa monthly"
+        return "—"
+    df["velocity_source"] = df.apply(_src, axis=1)
 
     # Days of supply
     df["days_of_supply"] = df.apply(
