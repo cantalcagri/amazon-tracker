@@ -33,3 +33,11 @@ build/
 
 # macOS
 .DS_Store
+
+# Dashboard venv + runtime artifacts (added this session)
+.venv/
+pipeline/.chrome_keepa/
+dashboard/dashboard_full_backup.py
+*.xlsx
+KeepaExport-*.csv
+pipeline/keepa_exports/

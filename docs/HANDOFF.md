@@ -1,114 +1,73 @@
-# Handoff — paste this into the next chat
+# Handoff — paste into the next chat
 
-> Copy everything below into a new conversation so the next Claude has full context.
+Copy this whole file into a new conversation so the next session has full context.
 
 ---
 
 ## Project
-**Amazon Tracker** at `/Users/cagri/Desktop/amazon-tracker` — tracks Amazon ASINs daily via Keepa, with three data sources feeding a Streamlit dashboard + replenishment recommendation engine.
+**Amazon Tracker** at `/Users/cagri/Desktop/amazon-tracker` — tracks 5,087 Amazon
+ASINs via Keepa. Two data sources feed one SQLite DB + a public dashboard.
 
-## Where things live
+## ⚠️ Hard rules (do not violate)
+- **NEVER use the user's Claude-account Gmail (`cantalcagri@gmail.com`) for Chrome,
+  Keepa, Amazon, or anything in this pipeline.** It must stay disconnected.
+- The Keepa account for this pipeline is **`trendyzone.sw`** in an **isolated Chrome
+  profile** at `pipeline/.chrome_keepa/` (separate from the user's main Chrome).
+- Keepa API key lives in `pipeline/.env` (gitignored). It was pasted in chat — **rotate it**.
 
-| Path | What |
-|---|---|
-| `pipeline/keepa_viewer_export.py` | Selenium → Keepa Viewer CSV → `fct_keepa_daily` (1 row/ASIN/day) |
-| `pipeline/keepa_csv_importer.py` | CSV importer for the above |
-| **`pipeline/keepa_api_offers.py`** | **API per-seller collector** — `--tick` mode, batches 100 ASINs, parses `stockCSV`/`offerCSV` into `fct_keepa_seller_history` |
-| `pipeline/replenishment.py` | SHIP_NOW / HOLD / AVOID_BUY / WATCH classifier |
-| `pipeline/browser_collector.py` | AOD scraper (legacy, doesn't currently inject stock — Keepa extension not in isolated Chrome) |
-| `pipeline/.env` | `KEEPA_API_KEY` lives here (gitignored) |
-| `dashboard/dashboard.py` | Streamlit dashboard, 2 views: 🔎 Single product trend / 🎯 Replenishment |
-| `dashboard/explore.ipynb` | Ad-hoc SQL exploration notebook |
-| `schema/schema.sql` | All tables + views |
-| `docs/keepa_api_reference.md` | Full Keepa API field reference |
+## Architecture (cost-optimal: free CSV + paid API)
+| Source | Script | Fills | Cost |
+|---|---|---|---|
+| **CSV** (Keepa Viewer, Selenium) | `keepa_viewer_export.py` → `keepa_csv_importer.py` | BSR, prices, offers, OOS%, monthly sold for ALL ASINs | 0 tokens |
+| **API** (`--loop`) | `keepa_api_offers.py` | per-seller stock/price history → true units sold | ~4–7 tok/ASIN |
 
-## Database (`pipeline/amazon_tracker.db`)
+The API also writes BSR/price to `fct_keepa_daily` for free (from `salesRankCurrent`
++ offerCSV). **New ASINs** get `history=1` (full 90-day BSR backfill, ~9 tok);
+**known ASINs** get `history=0` (today only). See `docs/DATA_SOURCING_PLAN.md`.
 
-Schema-of-record:
-- `dim_product(asin, brand, title, image_url, parent_asin, variation_size, variation_color)` — **1,089 ASINs**
-- `fct_keepa_daily(asin, snapshot_date, bsr, buy_box_price, fba_stock, fba_offers, fbm_offers, ...)` — **3 days × 1089 = ~3,200 rows** from CSV pipeline
-- `fct_keepa_seller_history(asin, seller_id, change_time, stock, price_cents, is_fba, is_prime)` — per-seller change events. **Trimmed to last 90 days. 27 ASINs, 55 active sellers, 840 stock events, 1861 price events.** Source: API.
-- `dim_keepa_seller(seller_id, seller_name, rating_pct, review_count, is_amazon)` — **376 sellers total, 55 with names** (Zappos, 6pm, ShoeMall, Amazon, etc.)
-- `asin_api_state(asin, last_fetched_at, fetch_success)` — drives stalest-first queue
-- `fct_asin_daily` — legacy AOD scraper output (units_sold computed via per-seller delta logic, but stock always NULL because Keepa extension not in isolated Chrome)
-- `v_daily_sales` view — derived sales from aggregate fba_stock deltas (fct_keepa_daily based)
-- **`v_asin_daily_sales` view — TRUE per-seller-derived sales (`fct_keepa_seller_history` based) ← USE THIS**
+## What's running right now (background, nohup)
+- **Collector loop** (`keepa_api_offers.py --loop`) — token-aware, fires a 100-ASIN
+  batch whenever balance ≥150, sleeps precisely for refill. ~1,000 ASINs/day.
+- **Watchdog** (`scripts/watchdog.sh`) — restarts the loop within 15 min if it dies.
+- **Dashboard** (Streamlit, `.venv`, port 8502) + **Cloudflare tunnel** (public URL).
+- Login Item `~/start_amazon_tracker.command` starts the watchdog at login.
+  `scripts/start_dashboard.sh` starts dashboard + tunnel + Keepa Chrome.
 
-## Keepa account state
-- API key: in `pipeline/.env` (originally pasted in chat history — **rotate it** at https://keepa.com/#!api when convenient)
-- **5 tokens/min refill, 300 burst cap** = 7,200/day budget
-- Bulk discount confirmed: ~4–6 tokens per ASIN when batched in 100
-- One full sync of 5K ASINs ≈ 20–30K tokens (~3 days of refill); weekly cadence sustainable
+Check state: `cd pipeline && /usr/bin/python3 keepa_api_offers.py --status`
+Dashboard URL: `bash scripts/dashboard_url.sh`
 
-## What the dashboard shows (per Single Product Trend page)
+## Progress (as of 2026-06-01)
+- 5,087 ASINs in catalog (22 dead ones removed from `tam_liste.xlsx` import)
+- ~1,100+ ASINs fetched for per-seller data; full sweep ~4–5 days
+- CSV imported once today → BSR/price/OOS for 4,848 ASINs (1 day of history so far)
+- Token usage tracked in `api_token_log`; ~6.7 tok/ASIN real cost (apparel = many sellers)
 
-Sidebar: **Brand** filter → cascades into **ASIN** dropdown (🏪 N indicator on ASINs with per-seller data; sorted first). Days slider 7–90 default 90.
+## Key facts
+- Tokens: 5/min refill = 7,200/day, burst cap 300. Loop spends at ~100% of refill,
+  **wastes nothing** (never idles at 300). Going negative is fine/expected.
+- **NO tokens wasted** unless the loop stops (watchdog covers crashes).
+- Dashboard: dark theme, `.streamlit/config.toml`, password REMOVED, line charts,
+  per-seller stock has Source + Seller-name dropdowns, aggregated default.
 
-Page sections:
-1. **Hero** — image, title, 5 KPI tiles (BSR, Buy-Box $, Total offers, FBA stock, FBA sellers) with day-over-day deltas
-2. **Ranking** — BSR chart
-3. **Competition & seller mix** — offer count, top-seller dominance, FBA share
-4. **Inventory & availability** — stock, OOS%
-5. **Pricing & sales velocity** — prices, monthly sold, daily velocity
-6. **True daily units sold** ← NEW: uses `v_asin_daily_sales`, KPIs + bars/restocks chart
-7. **Per-seller inventory** — multi-line stock chart (one per seller) + sellers table; can drill into a single seller for their stock/price chart
-
-Second view: **🎯 Replenishment** — recommendation engine with sidebar threshold sliders + click-to-drill on table rows.
-
-## Running things
-
-```bash
-# Daily aggregate snapshot from Keepa Viewer CSV (Chrome window needed)
-cd pipeline
-python keepa_viewer_export.py --asins-file ../data/asins.txt
-
-# Per-seller API collector — one batch of stalest ASINs
-python keepa_api_offers.py --tick
-
-# Backfill seller names for newly-discovered sellers (1 token each, smart "only-missing")
-python keepa_api_offers.py --seller-names
-
-# Status (no tokens spent)
-python keepa_api_offers.py --status
-
-# Dashboard
-cd ..
-DB_PATH=pipeline/amazon_tracker.db python3 -m streamlit run dashboard/dashboard.py --server.port=8502
-```
-
-## What's working and recent
-
-- ✅ Full per-seller API pipeline built + tested: 27 ASINs done, ~840 stock events captured
-- ✅ Per-seller daily sales computed via `v_asin_daily_sales` (confirmed: B07RS94LGR sold 937 units in 30d, B00RNFPU3W Kirkland boxer briefs sold 211)
-- ✅ Seller names populated for 55 active sellers (Zappos, 6pm, etc.)
-- ✅ History capped to 90 days (DB went from 24K rows → 2.5K)
-- ✅ Dashboard collapsed to 2 views per user request (was 4)
-- ✅ Brand filter cascades to ASIN, 🏪 indicators show seller-data availability
-
-## What's pending / next steps
-
-1. **Set up cron for `--tick` every 15 min** (snippet in `pipeline/keepa_api_offers.py` docstring) — not yet enabled
-2. **Backfill remaining 1062 ASINs** with per-seller data (will take ~7 days at current cadence; cron handles it automatically)
-3. **Wire `v_asin_daily_sales` into the recommendation engine** (`replenishment.py`) — currently uses aggregate `v_daily_sales`; should prefer the per-seller view when available
-4. **Hot-list priority refinement** — currently uses "FBA stock < 20" as hot signal; should use SHIP_NOW/HOLD recommendations once the engine flips to per-seller data
-5. **Optionally**: auto-run `--seller-names` from cron every 4 hours (mostly 0-cost; only fires for new sellers)
-
-## Open design questions to revisit
-
-- Whether to upsert per-seller-derived `units_sold` back into `fct_asin_daily` so existing queries that reference it (none yet, but possible) keep working
-- How to handle "seller disappeared" case in the sales view (currently only detects stock-down; a seller silently dropping off isn't credited as "all remaining sold" yet)
-- Whether to switch the `replenishment.py` velocity source automatically when per-seller is available, or expose a sidebar toggle
+## Pending / not yet done
+1. **Dual API key (2x speed)** — code is ready. User has a 2nd Keepa account+key.
+   To enable: add `KEEPA_API_KEY_2=<key>` to `pipeline/.env`, then:
+   `cp scripts/com.amazontracker.loop2.plist ~/Library/LaunchAgents/ && launchctl load ...`
+   Also set `KEEPA_N_SLOTS=2` for slot 1 (in watchdog env / its plist). Queue shards
+   by ASIN hash so the two keys never overlap. **NOT YET ENABLED.**
+2. **Daily CSV automation** — wired into `daily_pipeline.sh` but needs the Keepa Chrome
+   open. `start_dashboard.sh` auto-launches it. Not yet scheduled via launchd/cron.
+3. **Historical BSR** — new-ASIN backfill is coded but the existing 5,087 already-fetched
+   ASINs won't re-trigger it (they're "known"). To force a full historical backfill of
+   everything, would need a one-time `--history` pass over the whole catalog.
 
 ## Most recent git state
+- `main` @ `e8723bb` — all work committed. `9d941bc` was the last pushed to origin;
+  `27a2b07` + `e8723bb` are local commits **not yet pushed**.
 
-- `main` branch is up to date with `258839f → bbc816d` already pushed
-- **Uncommitted changes this session** (significant; not yet pushed): per-seller API collector additions to `pipeline/keepa_api_offers.py` (added `--seller-names`, 90-day cap), new view in `schema/schema.sql`, dashboard restructure in `dashboard/dashboard.py`, notebook additions, `docs/HANDOFF.md` itself
-
-## Token balance at handoff
-- Used 55 of 278 tokens this session on seller names → ~223 tokens left at last check
-- Refills 5/min, caps at 300
-
-## ⚠️ Repo gotchas (don't burn the next agent)
-- **NEVER** `pkill Google Chrome` or touch the user's real Chrome profile at `~/Library/Application Support/Google/Chrome` (per `CLAUDE.md` rules). The isolated profile lives at `pipeline/.chrome_profile/`.
-- The git remote URL has the user's GitHub PAT embedded — visible in `git remote -v`. User has been told to rotate.
-- Anaconda's streamlit is broken — use `/Library/Developer/CommandLineTools/.../python3 -m streamlit` (verified).
+## Gotchas
+- Use `/usr/bin/python3` for the collector, `.venv/bin/python` for dashboard + Selenium.
+- macOS blocks launchd from Desktop paths (TCC) — that's why we use nohup + Login Item.
+- `open -a "Google Chrome" --args --remote-debugging-port=9222` does NOT work if Chrome
+  is already running. Must fully quit first, OR use the dedicated profile launch (which
+  start_dashboard.sh does): `--user-data-dir=pipeline/.chrome_keepa`.
