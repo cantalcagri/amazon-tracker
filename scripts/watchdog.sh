@@ -18,12 +18,22 @@ echo "[$(date)] watchdog started (interval ${CHECK_INTERVAL}s, pid $$)" >> "$WLO
 
 # Match the actual python process only (Python binary running the script), so we
 # never self-match a shell whose command line merely contains the script name.
-running() { ps ax -o pid,command | grep -i "[p]ython.*keepa_api_offers.py --loop" >/dev/null 2>&1; }
+# Slot 1 (or single-key mode). When KEEPA_N_SLOTS=2 is set, this watchdog
+# only guards slot 1; loop2.sh / com.amazontracker.loop2.plist handles slot 2.
+SLOT="${KEEPA_API_KEY_SLOT:-1}"
+N_SLOTS="${KEEPA_N_SLOTS:-1}"
+
+running() {
+  # Match slot-1 python loop (no KEEPA_API_KEY_SLOT=2 in env)
+  ps ax -o pid,command | grep -i "[p]ython.*keepa_api_offers.py --loop" \
+    | grep -v "SLOT=2" >/dev/null 2>&1
+}
 
 while true; do
   if ! running; then
-    echo "[$(date)] collector loop is DOWN — restarting" >> "$WLOG"
-    cd "$PIPELINE" && nohup /usr/bin/python3 keepa_api_offers.py --loop >> "$LOG" 2>&1 &
+    echo "[$(date)] slot-${SLOT} loop is DOWN — restarting" >> "$WLOG"
+    cd "$PIPELINE" && KEEPA_API_KEY_SLOT=$SLOT KEEPA_N_SLOTS=$N_SLOTS \
+      nohup /usr/bin/python3 keepa_api_offers.py --loop >> "$LOG" 2>&1 &
     sleep 5
     if running; then
       echo "[$(date)] restart OK" >> "$WLOG"

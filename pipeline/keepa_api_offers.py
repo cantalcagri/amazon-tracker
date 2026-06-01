@@ -48,7 +48,19 @@ from dotenv import load_dotenv
 HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 
-API_KEY = os.environ.get("KEEPA_API_KEY")
+# Active API key — override with KEEPA_API_KEY_SLOT=2 env var to use the second
+# key. Each slot gets its own shard of the ASIN queue (by ASIN hash) so the two
+# loop instances never request the same ASIN and never burn each other's tokens.
+_SLOT = int(os.environ.get("KEEPA_API_KEY_SLOT", "1"))
+if _SLOT == 2:
+    API_KEY = os.environ.get("KEEPA_API_KEY_2") or os.environ.get("KEEPA_API_KEY")
+else:
+    API_KEY = os.environ.get("KEEPA_API_KEY")
+
+# Total number of key slots configured (1 = single key, 2 = dual key, etc.)
+# Used to shard the queue: slot N owns ASINs where hash(asin) % N_SLOTS == N-1
+N_SLOTS = int(os.environ.get("KEEPA_N_SLOTS", "1"))
+
 DB_PATH = os.environ.get("DB_PATH", str(HERE / "amazon_tracker.db"))
 KEEPA_BASE = "https://api.keepa.com"
 DOMAIN = 1  # amazon.com
@@ -138,32 +150,37 @@ def _cents_to_dollars(v: int | None) -> float | None:
     return v / 100.0 if v is not None and v >= 0 else None
 
 
-def _extract_daily_snapshot(p: dict, today: str) -> dict:
+def _extract_daily_snapshots(p: dict, today: str,
+                             full_history: bool = False,
+                             retention_days: int = HISTORY_RETENTION_DAYS) -> list[dict]:
     """
-    Extract fct_keepa_daily fields from a Keepa /product API response object.
+    Extract fct_keepa_daily rows from a Keepa /product API response.
 
-    This is the same data the Keepa Product Viewer CSV export provides, but
-    sourced directly from the API — no Selenium, no logged-in Chrome needed.
+    full_history=False (default, history=0 call):
+        Returns [today_snapshot] — current BSR/price/offers only.
 
-    The API returns current values for most fields we want. For fields that are
-    only in the CSV (e.g. monthly_sold), we do our best from what's available.
+    full_history=True (history=1 call, new ASINs):
+        Returns a list of daily snapshots going back `retention_days`.
+        Parses the full csv[3] BSR time-series and csv[18] buy-box time-series,
+        bucketing events into calendar days (last observation wins per day).
+        Non-BSR fields (offers, stock, OOS) are only set on today's row since
+        that data isn't available in historical time-series from offers=20.
+
+    The CSV Keepa Product Viewer export always wins when it exists — historical
+    rows use INSERT OR IGNORE so they never overwrite richer CSV rows.
     """
     stats = p.get("stats") or {}
-    csv_data = p.get("csv") or []          # price/rank history by type index
+    csv_data = p.get("csv") or []
     offers = p.get("offers") or []
     live_ids = set(p.get("liveOffersOrder") or [])
     live_offers = [o for o in offers if o.get("offerId") in live_ids]
 
-    # BSR: prefer the direct field (always present), fall back to csv[3] history.
-    # salesRankCurrent is returned by Keepa regardless of history=0/1.
+    # ── Today's aggregate fields (current state from live offers) ────────────
     bsr_current = p.get("salesRankCurrent")
     if not bsr_current:
         bsr_csv = csv_data[3] if len(csv_data) > 3 else None
         bsr_current = _last_val(bsr_csv)
 
-    # Buy-box price: prefer offerCSV of the buy-box winner (available without
-    # history), fall back to csv[18] when history=1 was requested.
-    # We compute this below after live_offers is built.
     bb_csv = csv_data[18] if len(csv_data) > 18 else None
     bb_price_from_history = _cents_to_dollars(_last_val(bb_csv))
 
@@ -223,30 +240,83 @@ def _extract_daily_snapshot(p: dict, today: str) -> dict:
     # Display group / category
     display_group = p.get("productGroup") or p.get("categoryTree", [{}])[0].get("name") if p.get("categoryTree") else None
 
-    return {
-        "snapshot_date":      today,
-        "asin":               p.get("asin"),
-        "sales_rank_current": bsr_current,
+    asin = p.get("asin")
+
+    def _base(date_str: str, bsr: int | None, bb: float | None) -> dict:
+        """Minimal row for a historical date — only BSR + buy-box price."""
+        return {
+            "snapshot_date": date_str, "asin": asin,
+            "sales_rank_current": bsr, "sales_rank_30d_avg": None,
+            "display_group": None, "monthly_sold": None,
+            "monthly_sold_num": None, "monthly_sold_date": None,
+            "buy_box_price": bb, "buy_box_stock": None,
+            "oos_90d_pct": None, "buy_box_seller": None,
+            "pct_top_seller_30d": None, "pct_top_seller_90d": None,
+            "is_fba_pct": None, "fba_offers": None, "fbm_offers": None,
+            "total_offers": None, "fba_stock": None,
+            "fba_price": None, "fbm_price": None, "raw_json": None,
+        }
+
+    # ── Today's full snapshot ────────────────────────────────────────────────
+    today_row = _base(today, bsr_current, bb_price)
+    today_row.update({
         "sales_rank_30d_avg": stats.get("avg30") if isinstance(stats.get("avg30"), int) else None,
         "display_group":      display_group,
         "monthly_sold":       monthly_sold_raw,
-        "monthly_sold_num":   None,     # filled below by caller via parse_magnitude
-        "monthly_sold_date":  None,
-        "buy_box_price":      bb_price,
+        "monthly_sold_num":   _parse_magnitude(monthly_sold_raw),
         "buy_box_stock":      bb_stock,
         "oos_90d_pct":        oos_90d,
         "buy_box_seller":     bb_seller_name,
         "pct_top_seller_30d": pct_top_30,
         "pct_top_seller_90d": pct_top_90,
-        "is_fba_pct":         None,
         "fba_offers":         fba_offers_count or None,
         "fbm_offers":         fbm_offers_count or None,
         "total_offers":       total_offers_count or None,
         "fba_stock":          fba_stock_total,
         "fba_price":          fba_price,
         "fbm_price":          fbm_price,
-        "raw_json":           None,   # we don't dump full JSON here; CSV path does
-    }
+    })
+
+    if not full_history:
+        return [today_row]
+
+    # ── Full historical BSR + buy-box price (csv[3] and csv[18]) ────────────
+    # Keepa returns up to 10 years; we cap at retention_days to keep DB lean.
+    # One row per calendar day; last observed value that day wins.
+    # Uses INSERT OR IGNORE so it never overwrites richer CSV-imported rows.
+    now_dt = datetime.now(timezone.utc)
+    cutoff = (now_dt - __import__('datetime').timedelta(days=retention_days)).date()
+
+    bsr_by_day: dict[str, int] = {}
+    bsr_csv_raw = csv_data[3] if len(csv_data) > 3 else []
+    if bsr_csv_raw:
+        for i in range(0, len(bsr_csv_raw) - 1, 2):
+            tmin, bsr_v = bsr_csv_raw[i], bsr_csv_raw[i + 1]
+            if bsr_v is None or bsr_v < 0:
+                continue
+            day = keepa_minute_to_datetime(tmin).date()
+            if day < cutoff:
+                continue
+            bsr_by_day[day.isoformat()] = int(bsr_v)
+
+    bb_by_day: dict[str, float] = {}
+    bb_csv_raw = csv_data[18] if len(csv_data) > 18 else []
+    if bb_csv_raw:
+        for i in range(0, len(bb_csv_raw) - 1, 2):
+            tmin, cents = bb_csv_raw[i], bb_csv_raw[i + 1]
+            if cents is None or cents < 0:
+                continue
+            day = keepa_minute_to_datetime(tmin).date()
+            if day < cutoff:
+                continue
+            bb_by_day[day.isoformat()] = cents / 100.0
+
+    # Merge the two day sets; skip today (already in today_row)
+    all_days = sorted((set(bsr_by_day) | set(bb_by_day)) - {today})
+    rows: list[dict] = [_base(d, bsr_by_day.get(d), bb_by_day.get(d))
+                        for d in all_days]
+    rows.append(today_row)   # today always last (richest data)
+    return rows
 
 
 # ── API ───────────────────────────────────────────────────────────────────
@@ -417,9 +487,12 @@ def pick_next_batch(conn: sqlite3.Connection, batch_size: int = MAX_BATCH_SIZE) 
     conn.commit()
 
     # Step 2: pick — uses a single SELECT with ORDER BY that encodes priority.
-    # Hot-list = ASINs flagged SHIP_NOW or HOLD in last computed recommendations.
-    # We don't have a persistent recommendations table yet, so for now the
-    # hot-list = ASINs with low FBA stock OR high recent velocity.
+    # When N_SLOTS > 1, each slot only picks ASINs from its shard (by ASIN hash)
+    # so two parallel loop instances (each with a different API key) never overlap.
+    shard_filter = ""
+    if N_SLOTS > 1:
+        shard_filter = f"AND (ABS(CAST(SUBSTR(s.asin,3,8) AS INTEGER)) % {N_SLOTS}) = {_SLOT - 1}"
+
     rows = conn.execute(f"""
         SELECT s.asin,
                -- Hot priority: low FBA stock + had recent velocity = high priority
@@ -433,6 +506,7 @@ def pick_next_batch(conn: sqlite3.Connection, batch_size: int = MAX_BATCH_SIZE) 
         LEFT JOIN fct_keepa_daily k
                ON k.asin = s.asin
               AND k.snapshot_date = (SELECT MAX(snapshot_date) FROM fct_keepa_daily)
+        WHERE 1=1 {shard_filter}
         ORDER BY
           -- Hot ASINs first (only if not fetched in last 24h, otherwise lose priority)
           CASE WHEN is_hot = 1
@@ -593,26 +667,25 @@ def parse_and_save(conn: sqlite3.Connection, products: list[dict],
         # variationCSV is a comma-separated string of sibling ASINs
         product_rows.append((asin, title, brand, image_url, parent_asin))
 
-        # ── fct_keepa_daily snapshot from API ────────────────────────────────
-        # Always write: even without history=1, the API gives us salesRankCurrent
-        # (BSR), buy-box price (from offerCSV), offer counts, and FBA stock for
-        # free as part of the offers+stock call. The CSV path can still overwrite
-        # with richer data (OOS%, monthly sold, 30d avg) via INSERT OR REPLACE.
-        snap = _extract_daily_snapshot(p, today)
-        snap["monthly_sold_num"] = _parse_magnitude(snap.get("monthly_sold"))
-        daily_rows.append((
-            snap["snapshot_date"], snap["asin"],
-            snap["sales_rank_current"], snap["sales_rank_30d_avg"],
-            snap["display_group"],
-            snap["monthly_sold"], snap["monthly_sold_num"], snap["monthly_sold_date"],
-            snap["buy_box_price"], snap["buy_box_stock"],
-            snap["oos_90d_pct"], snap["buy_box_seller"],
-            snap["pct_top_seller_30d"], snap["pct_top_seller_90d"],
-            snap["is_fba_pct"],
-            snap["fba_offers"], snap["fbm_offers"], snap["total_offers"],
-            snap["fba_stock"], snap["fba_price"], snap["fbm_price"],
-            snap["raw_json"],
-        ))
+        # ── fct_keepa_daily: today + optional full history ───────────────────
+        # _extract_daily_snapshots returns [today] normally, or
+        # [hist_day_1, ..., hist_day_N, today] when write_daily=full_history.
+        snaps = _extract_daily_snapshots(p, today, full_history=write_daily)
+        for snap in snaps:
+            daily_rows.append((
+                snap["snapshot_date"], snap["asin"],
+                snap["sales_rank_current"], snap["sales_rank_30d_avg"],
+                snap["display_group"],
+                snap["monthly_sold"], snap["monthly_sold_num"], snap["monthly_sold_date"],
+                snap["buy_box_price"], snap["buy_box_stock"],
+                snap["oos_90d_pct"], snap["buy_box_seller"],
+                snap["pct_top_seller_30d"], snap["pct_top_seller_90d"],
+                snap["is_fba_pct"],
+                snap["fba_offers"], snap["fbm_offers"], snap["total_offers"],
+                snap["fba_stock"], snap["fba_price"], snap["fbm_price"],
+                snap["raw_json"],
+            ))
+        stats["daily_rows"] = stats.get("daily_rows", 0) + len(snaps)
 
         stats["asins"] += 1
 
@@ -668,20 +741,47 @@ def parse_and_save(conn: sqlite3.Connection, products: list[dict],
               parent_asin = COALESCE(excluded.parent_asin, parent_asin)
         """, product_rows)
     if daily_rows:
-        conn.executemany("""
-            INSERT OR REPLACE INTO fct_keepa_daily (
-                snapshot_date, asin, sales_rank_current, sales_rank_30d_avg,
-                display_group, monthly_sold, monthly_sold_num, monthly_sold_date,
-                buy_box_price, buy_box_stock, oos_90d_pct, buy_box_seller,
-                pct_top_seller_30d, pct_top_seller_90d, is_fba_pct,
-                fba_offers, fbm_offers, total_offers,
-                fba_stock, fba_price, fbm_price, raw_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, daily_rows)
+        # Historical rows (past days): INSERT OR IGNORE — never overwrite richer
+        # CSV-imported data. Today's row: full merge — update any NULL fields but
+        # preserve non-NULL values already there (e.g. OOS% from CSV import).
+        hist_rows = [r for r in daily_rows if r[0] != today]
+        today_rows = [r for r in daily_rows if r[0] == today]
+        if hist_rows:
+            conn.executemany("""
+                INSERT OR IGNORE INTO fct_keepa_daily (
+                    snapshot_date, asin, sales_rank_current, sales_rank_30d_avg,
+                    display_group, monthly_sold, monthly_sold_num, monthly_sold_date,
+                    buy_box_price, buy_box_stock, oos_90d_pct, buy_box_seller,
+                    pct_top_seller_30d, pct_top_seller_90d, is_fba_pct,
+                    fba_offers, fbm_offers, total_offers,
+                    fba_stock, fba_price, fbm_price, raw_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, hist_rows)
+        if today_rows:
+            conn.executemany("""
+                INSERT INTO fct_keepa_daily (
+                    snapshot_date, asin, sales_rank_current, sales_rank_30d_avg,
+                    display_group, monthly_sold, monthly_sold_num, monthly_sold_date,
+                    buy_box_price, buy_box_stock, oos_90d_pct, buy_box_seller,
+                    pct_top_seller_30d, pct_top_seller_90d, is_fba_pct,
+                    fba_offers, fbm_offers, total_offers,
+                    fba_stock, fba_price, fbm_price, raw_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(snapshot_date, asin) DO UPDATE SET
+                    sales_rank_current = COALESCE(sales_rank_current, excluded.sales_rank_current),
+                    buy_box_price      = COALESCE(buy_box_price,      excluded.buy_box_price),
+                    buy_box_stock      = COALESCE(buy_box_stock,      excluded.buy_box_stock),
+                    buy_box_seller     = COALESCE(buy_box_seller,     excluded.buy_box_seller),
+                    fba_offers         = COALESCE(fba_offers,         excluded.fba_offers),
+                    fbm_offers         = COALESCE(fbm_offers,         excluded.fbm_offers),
+                    total_offers       = COALESCE(total_offers,       excluded.total_offers),
+                    fba_stock          = COALESCE(fba_stock,          excluded.fba_stock),
+                    fba_price          = COALESCE(fba_price,          excluded.fba_price),
+                    fbm_price          = COALESCE(fbm_price,          excluded.fbm_price)
+            """, today_rows)
     conn.commit()
 
     stats["processed_asins"] = processed
-    stats["daily_rows"] = len(daily_rows)
     return stats
 
 
@@ -768,9 +868,29 @@ def show_status(conn: sqlite3.Connection) -> None:
 
 
 # ── Main run ──────────────────────────────────────────────────────────────
+def _new_asins(conn: sqlite3.Connection, asins: list[str]) -> set[str]:
+    """Return the subset of ASINs that have never been fetched before.
+    These get history=1 so we backfill their full BSR/price timeline.
+    """
+    rows = conn.execute(
+        "SELECT asin FROM asin_api_state WHERE asin IN ({}) "
+        "AND last_fetched_at IS NOT NULL".format(",".join("?" * len(asins))),
+        asins,
+    ).fetchall()
+    already_fetched = {r["asin"] for r in rows}
+    return set(asins) - already_fetched
+
+
 def tick(conn: sqlite3.Connection, dry_run: bool = False,
          batch_size: int = MAX_BATCH_SIZE, with_history: bool = False) -> int:
-    """One tick: pick a batch, fetch, save. Returns # ASINs processed."""
+    """One tick: pick a batch, fetch, save. Returns # ASINs processed.
+
+    Smart history mode (default):
+      - New ASINs (never fetched before) → history=1, full 90-day BSR backfill.
+        Up to 20 per tick to keep token spend bounded (~9 tok/ASIN vs ~4).
+      - Known ASINs → history=0 (cost-optimal, just today's snapshot).
+    Pass with_history=True to force history=1 for all ASINs in the batch.
+    """
     if not API_KEY:
         log.error("KEEPA_API_KEY not set in environment / .env")
         return 0
@@ -784,7 +904,7 @@ def tick(conn: sqlite3.Connection, dry_run: bool = False,
     log.info("Token balance: %d", balance)
 
     if balance < MIN_TOKENS_TO_RUN:
-        log.info("Balance below MIN_TOKENS_TO_RUN=%d — skipping (will retry next tick)", MIN_TOKENS_TO_RUN)
+        log.info("Balance below MIN_TOKENS_TO_RUN=%d — skipping", MIN_TOKENS_TO_RUN)
         return 0
 
     # 2. Pick the batch
@@ -794,52 +914,66 @@ def tick(conn: sqlite3.Connection, dry_run: bool = False,
         log.info("No ASINs eligible for fetch (catalog empty?)")
         return 0
 
-    # Keepa lets a single call go negative on tokens (call succeeds, then we
-    # wait for refill). So once we're above MIN_TOKENS_TO_RUN, just send the
-    # full 100. The MIN_TOKENS_TO_RUN gate above (150) ensures the deficit
-    # afterward is bounded (~150 - 400 = -250, refills in ~50 min at 5/min).
-    log.info("Sending full batch of %d ASINs (balance may go negative, refills 5/min)", len(asins))
-
     if dry_run:
         print(f"[DRY RUN] Would fetch {len(asins)} ASINs:")
-        for a in asins[:10]:
-            print(f"  {a}")
-        if len(asins) > 10:
-            print(f"  ... and {len(asins) - 10} more")
+        for a in asins[:10]: print(f"  {a}")
+        if len(asins) > 10: print(f"  ... and {len(asins) - 10} more")
         return 0
 
-    # 3. Fetch
-    try:
-        data = fetch_products(asins, with_history=with_history)
-    except Exception as e:
-        log.error("API fetch failed: %s", e)
-        mark_failures(conn, asins, str(e))
-        return 0
+    total_processed = 0
 
-    log_token_usage(conn, "product", len(asins), data, with_history)
-    products = data.get("products", []) or []
+    # 3a. New ASINs: history=1 for full BSR backfill (max 20 per tick)
+    if not with_history:
+        new = sorted(_new_asins(conn, asins))[:20]
+        if new:
+            log.info("New ASINs in batch: %d → fetching with history=1 (full backfill)", len(new))
+            try:
+                data = fetch_products(new, with_history=True)
+            except Exception as e:
+                log.error("History fetch failed: %s", e)
+                mark_failures(conn, new, str(e))
+                new = []
+            if new:
+                log_token_usage(conn, "product", len(new), data, True)
+                products = data.get("products", []) or []
+                stats = parse_and_save(conn, products, write_daily=True)
+                log.info("New ASINs: %d · %d daily-rows (history) · %d stock",
+                         stats["asins"], stats.get("daily_rows", 0), stats["stock_events"])
+                missing = [a for a in new if a not in stats.get("processed_asins", set())]
+                if missing: mark_failures(conn, missing, "no product returned by Keepa")
+                total_processed += stats["asins"]
+        # Remove new ASINs from the main batch
+        known_asins = [a for a in asins if a not in set(new if not with_history else [])]
+    else:
+        known_asins = asins
 
-    # 4. Parse + save (write fct_keepa_daily only when we paid for history)
-    stats = parse_and_save(conn, products, write_daily=with_history)
-    log.info("Saved: %d ASINs · %d stock · %d price · %d seller-gone · "
-             "%d daily-rows · %d truncated (skipped %d older than %dd)",
-             stats["asins"], stats["stock_events"], stats["price_events"],
-             stats.get("gone_events", 0), stats.get("daily_rows", 0),
-             stats.get("truncated_asins", 0),
-             stats.get("skipped_old", 0), HISTORY_RETENTION_DAYS)
+    # 3b. Known ASINs: history=0 (cost-optimal)
+    if known_asins:
+        log.info("Known ASINs: %d → fetching with history=0 (today only)", len(known_asins))
+        try:
+            data = fetch_products(known_asins, with_history=with_history)
+        except Exception as e:
+            log.error("API fetch failed: %s", e)
+            mark_failures(conn, known_asins, str(e))
+            return total_processed
 
-    # 4b. Reconcile: ASINs we asked for but Keepa didn't return (dead/invalid
-    # ASIN, domain mismatch). Mark them failed so last_attempted_at advances and
-    # they drop to the back of the queue instead of being re-requested forever.
-    missing = [a for a in asins if a not in stats.get("processed_asins", set())]
-    if missing:
-        log.warning("%d/%d requested ASINs not returned by Keepa — marking failed: %s",
-                    len(missing), len(asins), ", ".join(missing[:5]) + ("…" if len(missing) > 5 else ""))
-        mark_failures(conn, missing, "no product returned by Keepa")
+        log_token_usage(conn, "product", len(known_asins), data, with_history)
+        products = data.get("products", []) or []
+        stats = parse_and_save(conn, products, write_daily=with_history)
+        log.info("Known ASINs saved: %d · %d stock · %d price · %d seller-gone · "
+                 "%d daily-rows · %d truncated (skipped %d older than %dd)",
+                 stats["asins"], stats["stock_events"], stats["price_events"],
+                 stats.get("gone_events", 0), stats.get("daily_rows", 0),
+                 stats.get("truncated_asins", 0),
+                 stats.get("skipped_old", 0), HISTORY_RETENTION_DAYS)
+        # Reconcile missing ASINs
+        missing = [a for a in known_asins if a not in stats.get("processed_asins", set())]
+        if missing:
+            log.warning("%d ASINs not returned by Keepa — marking failed", len(missing))
+            mark_failures(conn, missing, "no product returned by Keepa")
+        total_processed += stats["asins"]
 
-    # 5. Auto-resolve names for any brand-new seller_ids we just discovered.
-    # only_missing=True skips sellers we already have a name for, so we spend
-    # exactly 1 token per truly-new seller — name mapping is permanent.
+    # 5. Auto-resolve seller names
     try:
         n_named = update_seller_names(conn, only_missing=True, only_active_days=HISTORY_RETENTION_DAYS)
         if n_named:
@@ -847,7 +981,7 @@ def tick(conn: sqlite3.Connection, dry_run: bool = False,
     except Exception as e:
         log.warning("Auto seller-name resolution failed (non-fatal): %s", e)
 
-    return stats["asins"]
+    return total_processed
 
 
 def run_loop(conn: sqlite3.Connection, batch_size: int = MAX_BATCH_SIZE,

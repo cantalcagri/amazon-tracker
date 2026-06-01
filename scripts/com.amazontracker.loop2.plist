@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.amazontracker.loop2</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/cagri/Desktop/amazon-tracker/pipeline/keepa_api_offers.py</string>
+        <string>--loop</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/cagri/Desktop/amazon-tracker/pipeline</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DB_PATH</key>
+        <string>/Users/cagri/Desktop/amazon-tracker/pipeline/amazon_tracker.db</string>
+        <key>KEEPA_MIN_TOKENS</key>
+        <string>150</string>
+        <key>KEEPA_API_KEY_SLOT</key>
+        <string>2</string>
+        <key>KEEPA_N_SLOTS</key>
+        <string>2</string>
+    </dict>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/cagri/Desktop/amazon-tracker/logs/loop2.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/cagri/Desktop/amazon-tracker/logs/loop2.err.log</string>
+</dict>
+</plist>
