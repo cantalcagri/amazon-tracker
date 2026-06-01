@@ -42,6 +42,11 @@ DB_PATH = os.environ.get("DB_PATH", str(HERE / "amazon_tracker.db"))
 CSV_FRESH_DAYS = 2
 CSV_MISSING_WARN_PCT = 5.0
 
+# Must match HISTORY_RETENTION_DAYS in keepa_api_offers.py — the collector skips
+# events older than this at insert time, and --purge deletes rows that aged past
+# it (insert-time skipping alone never shrinks already-stored rows).
+RETENTION_DAYS = int(os.environ.get("KEEPA_RETENTION_DAYS", 90))
+
 
 @dataclass
 class Check:
@@ -52,8 +57,9 @@ class Check:
 
 
 def get_conn(db_path: str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 
@@ -185,6 +191,24 @@ def run_checks(conn) -> list[Check]:
 
 
 # ── Housekeeping ────────────────────────────────────────────────────────────
+def purge_old_history(conn, retention_days: int = RETENTION_DAYS) -> int:
+    """Delete seller-history events older than the retention window.
+
+    The collector skips old events at INSERT, but rows stored on an earlier run
+    still age out — without this the table grows unbounded. Returns rows deleted.
+    Backed by idx_seller_hist_time(change_time) so it stays cheap at 5K ASINs.
+    """
+    if not _table_exists(conn, "fct_keepa_seller_history"):
+        return 0
+    cur = conn.execute(
+        "DELETE FROM fct_keepa_seller_history "
+        "WHERE change_time < datetime('now', ?)",
+        (f"-{retention_days} days",),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def clean_orphan_sellers(conn, include_named: bool = False) -> int:
     """Delete dim_keepa_seller rows with no history events.
 
@@ -225,6 +249,8 @@ def format_markdown(checks: list[Check]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Pipeline health check + housekeeping")
     ap.add_argument("--json", action="store_true", help="Emit JSON instead of markdown")
+    ap.add_argument("--purge", action="store_true",
+                    help=f"Delete seller-history events older than {RETENTION_DAYS} days")
     ap.add_argument("--clean", action="store_true",
                     help="Delete UNNAMED orphan sellers (keeps paid-for named rows)")
     ap.add_argument("--clean-all", action="store_true",
@@ -234,6 +260,9 @@ def main() -> int:
 
     conn = get_conn()
     try:
+        if args.purge:
+            n = purge_old_history(conn)
+            print(f"Purged {n} seller-history event(s) older than {RETENTION_DAYS} days.")
         if args.clean or args.clean_all:
             deleted = clean_orphan_sellers(conn, include_named=args.clean_all)
             print(f"Pruned {deleted} orphan seller row(s)"

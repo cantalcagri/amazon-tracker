@@ -1,241 +1,152 @@
-# Amazon Seller Tracker Pipeline
+# Amazon Seller Tracker
 
-Track BSR, seller inventory, prices, and daily units sold for any Amazon ASIN.
+Track BSR, per-seller inventory, prices, and daily units sold for Amazon ASINs
+using **Keepa** as the data source. Produces a replenishment recommendation
+(SHIP_NOW / HOLD / AVOID_BUY / WATCH) per ASIN.
+
+See [CLAUDE.md](CLAUDE.md) for the full architecture and data model.
 
 ---
 
-## Project Structure
+## Two data pipelines
+
+| Path | Script | Writes | Cost |
+|---|---|---|---|
+| **A. Daily aggregate** | `keepa_viewer_export.py` → `keepa_csv_importer.py` | `fct_keepa_daily` (BSR, buy-box, offer counts, aggregate FBA stock) | 0 API tokens (Selenium CSV export) |
+| **B. Per-seller** | `keepa_api_offers.py --tick` | `fct_keepa_seller_history`, `dim_keepa_seller` | ~4 Keepa tokens/ASIN |
+
+Units sold is derived in SQL view `v_asin_daily_sales` from per-seller stock
+deltas (per-seller decrease = sold; new sellers excluded; a seller going to
+stock 0 / disappearing credits its last stock as sold). See "Units sold" below.
+
+---
+
+## Project structure
 
 ```
 amazon-tracker/
+├── data/asins.txt              ← THE ASIN list (one per line, # = comment)
 ├── schema/
-│   └── schema.sql          ← All database tables (star schema)
+│   ├── schema.sql              ← tables + views (safe to re-run)
+│   └── migrations/             ← idempotent one-off migrations
 ├── pipeline/
-│   └── collector.py        ← Data collection + units-sold logic
-├── dashboard/
-│   └── dashboard.py        ← Streamlit analytics dashboard
-├── config/
-│   └── .env.template       ← Environment config template
-└── requirements.txt
+│   ├── keepa_api_offers.py     ← Path B: per-seller API collector
+│   ├── keepa_viewer_export.py  ← Path A: Selenium → Keepa Viewer CSV
+│   ├── keepa_csv_importer.py   ← Path A: CSV → fct_keepa_daily
+│   ├── replenishment.py        ← recommendation engine
+│   ├── health_check.py         ← data-quality checks + retention purge
+│   └── db.py                   ← shared sqlite helpers
+├── dashboard/dashboard.py      ← Streamlit dashboard (primary UI)
+├── dash_app/                   ← newer Plotly Dash + DuckDB UI (partial)
+├── scripts/daily_pipeline.sh   ← orchestrated daily run (launchd/cron)
+└── docs/                       ← Keepa reference + handoff notes
 ```
 
 ---
 
-## Quick Start (VS Code)
-
-### 1. Install Python dependencies
-
-Open the terminal in VS Code (`Ctrl+`` ` ``) and run:
+## Quick start
 
 ```bash
-cd amazon-tracker
 pip install -r requirements.txt
-```
 
-### 2. Configure environment
-
-```bash
+# Configure secrets
 cp config/.env.template pipeline/.env
-# Edit pipeline/.env with your settings (optional for basic use)
+# edit pipeline/.env → set KEEPA_API_KEY
+
+# Initialize the database
+python -c "import sys; sys.path.insert(0,'pipeline'); import db; db.init_db()"
 ```
 
-### 3. Run first pipeline snapshot
+### Path A — daily aggregate snapshot (Keepa Viewer CSV)
+
+Needs a Chrome window logged into keepa.com, with remote debugging on:
 
 ```bash
-cd pipeline
-python collector.py --asin B0CV3CDPTK
-```
-
-This will:
-- Create `amazon_tracker.db` (SQLite)
-- Scrape the product page + seller offers
-- Save BSR snapshot
-- Calculate daily units sold (needs 2 days before sales appear)
-
-### 4. Run again next day (or schedule it)
-
-```bash
-# Run every 6 hours automatically:
-python collector.py --asin B0CV3CDPTK --scheduler --interval 6
-```
-
-### 5. View the dashboard
-
-```bash
-cd dashboard
-DB_PATH=../pipeline/amazon_tracker.db streamlit run dashboard.py
-```
-
-Open http://localhost:8501 in your browser.
-
----
-
-## Data Model (Star Schema)
-
-```
-dim_product ──────────┐
-dim_seller  ──────────┤──→ fact_seller_snapshot  (raw, 10-day rolling)
-dim_date    ──────────┤──→ fact_bsr_snapshot     (raw, 10-day rolling)
-                      └──→ fact_daily_units_sold (calculated, keep forever)
-                           agg_product_daily     (summary, keep forever)
-```
-
-### Retention Policy
-| Table | Retention |
-|---|---|
-| `fact_seller_snapshot` | 10 days (raw snapshots purged automatically) |
-| `fact_bsr_snapshot` | 10 days |
-| `fact_daily_units_sold` | Forever (already aggregated) |
-| `agg_product_daily` | Forever |
-
----
-
-## Units Sold Calculation Logic
-
-```
-day1:  S1=5, S2=3, S3=2
-day2:  S1=4, S2=3, S4=2  (S3 gone, S4 is new)
-
-Calculation:
-  S1: 5→4 = 1 sold ✓
-  S2: 3→3 = 0 sold ✓
-  S3: 5→(gone) = 2 sold (all remaining) ✓
-  S4: new seller → EXCLUDED from day1→day2 calc ✓
-
-Total sold: 1 + 0 + 2 = 3 units minimum
-```
-
----
-
-## Amazon Scraping vs Keepa API
-
-| | Web Scraping | Keepa API |
-|---|---|---|
-| Cost | Free | ~$20/mo |
-| Reliability | Can break, gets blocked | Stable |
-| BSR history | Last run only | Years of history |
-| Legality | Against Amazon ToS | ✓ |
-| Setup | Just run it | Add `KEEPA_API_KEY` to `.env` |
-
-**Recommendation:** Start with scraping locally. For production, add Keepa.
-
-To use Keepa:
-```bash
-python collector.py --asin B0CV3CDPTK --keepa
-```
-
----
-
-## Tracking Multiple ASINs
-
-```bash
-# Run pipeline for multiple ASINs:
-python collector.py --asin B0CV3CDPTK --scheduler
-# (Edit collector.py start_scheduler call to add more ASINs)
-```
-
-Or edit the bottom of `collector.py`:
-```python
-start_scheduler(["B0CV3CDPTK", "B0CL5Z7VFR"], interval_hours=6)
-```
-
----
-
-## Dashboard Features
-
-- **BSR Trend** — daily rank chart (inverted axis, lower = better)
-- **Price Trend** — weighted avg / min / max per day
-- **Seller Count** — FBA vs FBM stacked bar
-- **Units Sold** — per seller breakdown table with color coding
-  - 🟡 New sellers (excluded from sales calc)
-  - 🟢 Sellers with units sold
-- **Raw Snapshots** — full expandable table
-
----
-
-## Database Queries (useful SQL)
-
-```sql
--- Today's sellers with prices
-SELECT * FROM v_latest_seller_snapshot;
-
--- Daily sales summary
-SELECT * FROM v_daily_sales_summary;
-
--- BSR history
-SELECT snapshot_date, bsr_rank FROM fact_bsr_snapshot
-WHERE product_id=1 ORDER BY snapshot_date;
-
--- Manual cleanup
-DELETE FROM fact_seller_snapshot WHERE snapshot_date < date('now','-10 days');
-```
-
----
-
-## Keepa Viewer Export (automated CSV download → SQLite)
-
-Pulls the full Keepa **Product Viewer** CSV for a list of ASINs and imports it into the cumulative `fct_keepa_daily` table — no manual clicks.
-
-**What it captures per ASIN per day** (cumulative, never purged):
-- BSR current + 30-day average
-- Buy-box price, stock, seller name
-- 90-day OOS%
-- Monthly sold estimate
-- `% Top Seller` for 30 and 90 days
-- Full raw row dumped to `raw_json` so nothing is ever lost
-
-### One-time setup
-
-1. Launch an **isolated** Chrome window (does NOT touch your regular Chrome):
-   ```bash
-   open -na "Google Chrome" --args \
-     --user-data-dir="$(pwd)/pipeline/.chrome_profile" \
-     --remote-debugging-port=9222
-   ```
-2. In that new window, sign into [keepa.com](https://keepa.com) once. The session is saved in `pipeline/.chrome_profile/` so you only do this once.
-
-### Daily run
-
-```bash
+open -a "Google Chrome" --args --remote-debugging-port=9222
 cd pipeline
 python keepa_viewer_export.py --asins-file ../data/asins.txt
 ```
 
-That single command:
-1. Attaches to the isolated Chrome via CDP (port 9222)
-2. Builds the Keepa viewer URL with all ASINs hash-encoded
-3. Clicks **Export → CSV** automatically
-4. Saves the CSV to `pipeline/keepa_exports/keepa_viewer_<timestamp>_<count>asins.csv`
-5. Imports rows into `fct_keepa_daily` (re-running the same day overwrites — idempotent)
+This attaches to Chrome via CDP, builds the Keepa Viewer URL for all ASINs,
+clicks **Export → CSV**, saves to `pipeline/keepa_exports/`, and imports into
+`fct_keepa_daily` (re-running the same day overwrites — idempotent).
 
-Useful flags:
-- `--no-import` — skip the SQLite import (just save the CSV)
-- `--keep-tab` — leave the Keepa viewer tab open after export
-- `--asins-file PATH` — override the input file (default: `pipeline/asins.txt`)
+Flags: `--no-import` (download only), `--keep-tab`, `--asins-file PATH`.
 
-### View the data
+Re-import an existing CSV without Chrome:
 
 ```bash
-DB_PATH=pipeline/amazon_tracker.db streamlit run dashboard/dashboard.py
+python keepa_csv_importer.py keepa_exports/keepa_viewer_<timestamp>.csv
 ```
 
-The dashboard has two views:
-- **📊 Overview** — KPIs (total ASINs, avg BSR, OOS counts), daily coverage chart, latest-snapshot table
-- **🔎 Per-ASIN drilldown** — BSR trend with 30-day average overlay, buy-box price + stock chart, raw snapshot history
-
-### Re-importing an existing CSV (no Chrome needed)
+### Path B — per-seller API collector
 
 ```bash
 cd pipeline
-python keepa_csv_importer.py keepa_exports/keepa_viewer_20260524_011911_1073asins.csv
+python keepa_api_offers.py --status        # token balance + queue stats (0 tokens)
+python keepa_api_offers.py --tick          # one batch of stalest ASINs (for cron)
+python keepa_api_offers.py --seller-names  # resolve names for new sellers (1 token each)
 ```
 
-### Troubleshooting
+For 5,000 ASINs run `--tick` continuously (e.g. cron every 15 min, 24/7); a
+short daily burst can't keep the queue fresh — see CLAUDE.md "token economics".
 
-| Symptom | Fix |
-|---|---|
-| `Couldn't connect to 127.0.0.1:9222` | Isolated Chrome isn't running. Re-run the one-time setup command. |
-| Table loads but Export button times out | Keepa changed selectors. Update `.tool__export` / `#exportSubmit` in `keepa_viewer_export.py`. |
-| Only a few rows imported | Check `--asins-file` points at the real master list (not the 252-row test subset). |
-| `no such column: product_id` in dashboard | Old `dashboard.py` cached. Restart Streamlit. |
+### Health & housekeeping
 
+```bash
+python health_check.py                 # data-quality report (exit 1 if any fail)
+python health_check.py --purge --vacuum  # enforce 90-day retention, shrink DB
+```
+
+### Orchestrated daily run
+
+```bash
+bash scripts/daily_pipeline.sh
+# Deploy on macOS via scripts/com.amazontracker.daily.plist (launchd)
+```
+
+### Dashboard
+
+```bash
+# Streamlit (primary)
+DB_PATH=pipeline/amazon_tracker.db streamlit run dashboard/dashboard.py
+# Dash + DuckDB (newer, partial)
+DB_PATH=pipeline/amazon_tracker.db python3 dash_app/app.py
+```
+
+---
+
+## Units sold
+
+`v_asin_daily_sales` (canonical), computed from `fct_keepa_seller_history`:
+
+```
+day1:  S1=5, S2=3, S3=2
+day2:  S1=4, S2=3, S4=2   (S3 gone, S4 is new)
+
+  S1: 5→4 = 1 sold
+  S2: 3→3 = 0 sold
+  S3: gone → last stock (2) credited as sold
+  S4: new seller → EXCLUDED from this day (first observation)
+Total = 3 units (a lower bound; restocks between observations can mask sales)
+```
+
+ASINs without per-seller data yet fall back to `v_daily_sales` (aggregate FBA
+stock deltas).
+
+---
+
+## Multi-marketplace / Costco
+
+`dim_product` carries `marketplace` (default `amazon_us`) plus `item_uid` and
+`gtin` — the marketplace-neutral identity for joining Amazon listings to Costco
+or other marketplaces. The Amazon ASIN is not a stable cross-marketplace key.
+
+---
+
+## Keepa vs scraping
+
+Path A still uses Selenium to export the Keepa Viewer CSV (free, but needs a
+logged-in Chrome). Path B uses the Keepa HTTP API (paid tokens, headless,
+deterministic). The API can also serve the Path-A fields directly — see the
+"retire Selenium" note in the audit if you want a fully headless pipeline.

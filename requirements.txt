@@ -1,12 +1,18 @@
-selenium>=4.18
-webdriver-manager>=4.0
-beautifulsoup4>=4.12
-lxml>=5.0
-schedule>=1.2
+# Core pipeline (Keepa API path — required)
+requests>=2.31
 python-dotenv>=1.0
+pandas>=2.0
+
+# Dashboards
 streamlit>=1.35
 plotly>=5.20
-pandas>=2.0
-requests>=2.31
 duckdb>=1.0
 dash>=4.0
+
+# Selenium CSV path (Path A) — only needed if you still use keepa_viewer_export.py.
+# The API path now populates fct_keepa_daily directly, so these are optional.
+selenium>=4.18
+webdriver-manager>=4.0
+
+# Removed (no live consumer after the AOD scraper was deleted):
+#   beautifulsoup4, lxml, schedule

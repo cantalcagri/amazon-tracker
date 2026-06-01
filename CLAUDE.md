@@ -1,43 +1,54 @@
 # Amazon Seller Tracker — Project Context
 
 This file is read automatically by Claude Code (VS Code extension).
-It gives Claude full context about this project so you don't have to re-explain every session.
+It gives Claude full context so you don't have to re-explain every session.
 
----
-
-## ⛔ ABSOLUTE RULES — NEVER VIOLATE
-
-1. **NEVER run `pkill` or `kill` on "Google Chrome"** — this logs the user out of all accounts and destroys their session. It has happened and caused serious disruption. There is no exception.
-2. **NEVER touch the user's real Chrome profile** at `~/Library/Application Support/Google/Chrome` — copying, deleting, or modifying it has broken their extensions before.
-3. To launch Chrome for the CSV exporter: launch manually with `open -a "Google Chrome" --args --remote-debugging-port=9222` and let `keepa_viewer_export.py` attach via CDP. (The archived scraper used `create_driver()` + `--user-data-dir=pipeline/.chrome_profile`.)
+> **History note:** an earlier version of this project used a Selenium + Keepa
+> Chrome-extension AOD scraper (`browser_collector.py`, `keepa_collector.py`).
+> **Those scripts were deleted.** If you find docs/memories referencing
+> `browser_collector`, `_expand_see_more`, `dim_seller`, `fact_seller_snapshot`,
+> or `KEEPA_USERNAME/PASSWORD`, they are stale — ignore them. The current system
+> is 100% Keepa-based (one Selenium CSV step + the Keepa HTTP API).
 
 ---
 
 ## What this project does
 
-Tracks Amazon product listings daily:
-- Seller inventory levels (FBA and FBM sellers separately)
-- Prices per seller (weighted average, min, max)
-- Best Sellers Rank (BSR)
-- Calculates **estimated daily units sold** by comparing inventory snapshots day over day
+Tracks Amazon product listings over time using **Keepa** as the data source:
+- BSR, buy-box price/stock, FBA/FBM offer counts, aggregate FBA stock (daily)
+- **Per-seller** stock & price change history (from the Keepa API)
+- Derives **daily units sold** per ASIN from per-seller stock deltas
+- Produces a **replenishment recommendation** (SHIP_NOW / HOLD / AVOID_BUY / WATCH)
 
-## Units sold logic (critical — don't change this)
+The long-term goal is to scale to **5,000+ ASINs**, link some products to a
+**Costco pipeline**, and add **other marketplaces** — so the schema is being
+made marketplace-neutral (see "Multi-marketplace" below).
 
-```
-Day 1:  S1=5, S2=3, S3=2
-Day 2:  S1=4, S2=3, S4=2   (S3 gone, S4 is new)
+## Units sold logic (critical — don't silently change the numbers)
 
-Result:
-  S1: 5→4 = 1 sold
-  S2: 3→3 = 0 sold
-  S3: gone = 2 sold (all remaining, went OOS)
-  S4: NEW seller → excluded from day1→day2 calculation
+Units sold is computed in SQL view `v_asin_daily_sales` from per-seller stock
+change events:
+- A seller's stock **decreases** by N → **N units sold**.
+- A seller's stock **increases** → restock, ignored (counts toward restocked, not sold).
+- A **brand-new** seller (no prior event) → excluded from that day (first observation).
+- A seller **disappears** (Keepa emits stock `-1`, parsed to `0`) → their last
+  known stock counts as sold. See `v_asin_daily_sales` for the exact handling.
 
-Total minimum units sold = 3
-```
+Summed across all sellers per (asin, day). This is a **lower bound**: restocks
+between two Keepa observations can mask sales.
 
-New sellers on any given day are NEVER counted toward the previous day's sales.
-If a seller disappears, ALL their remaining inventory counts as sold.
+---
+
+## Two data pipelines (both write `pipeline/amazon_tracker.db`)
+
+| Path | Script | Writes | Cost | Notes |
+|---|---|---|---|---|
+| **A. Daily aggregate** | `keepa_viewer_export.py` → `keepa_csv_importer.py` | `fct_keepa_daily` (1 row/ASIN/day) | 0 API tokens | Selenium drives a logged-in Chrome to export Keepa's Product Viewer CSV |
+| **B. Per-seller** | `keepa_api_offers.py --tick` | `fct_keepa_seller_history`, `dim_keepa_seller` | ~4 tokens/ASIN | Keepa HTTP API; stalest-first queue in `asin_api_state` |
+
+Path A is the source of BSR/price/offer-count/aggregate-stock charts and the
+replenishment engine inputs. Path B is the source of true per-seller stock and
+the canonical units-sold figure.
 
 ---
 
@@ -45,174 +56,121 @@ If a seller disappears, ALL their remaining inventory counts as sold.
 
 ```
 amazon-tracker/
-├── CLAUDE.md                        ← you are here
+├── CLAUDE.md                       ← you are here
+├── README.md
 ├── requirements.txt
-├── schema/
-│   └── schema.sql                   ← SQLite schema + views (safe to re-run)
-├── pipeline/                        ← ACTIVE pipeline (only 5 scripts run)
-│   ├── keepa_viewer_export.py       ← Selenium → Keepa Viewer CSV (aggregate daily)
-│   ├── keepa_csv_importer.py        ← imports that CSV → fct_keepa_daily
-│   ├── keepa_api_offers.py          ← MAIN per-seller collector (API, --tick)
-│   ├── replenishment.py             ← SHIP/HOLD/AVOID recommendation engine
-│   ├── db.py                        ← shared SQLite helpers
-│   ├── health_check.py              ← data-quality guardrails + seller housekeeping
-│   ├── asins.txt                    ← legacy 252-ASIN subset (kept as fallback)
-│   ├── .chrome_profile/             ← tracker's own Chrome profile (Keepa session)
-│   └── .env                         ← secrets/config (not in git)
 ├── data/
-│   └── asins.txt                    ← 1,073-ASIN master list (primary input)
+│   └── asins.txt                   ← THE ASIN list (one per line, # = comment)
+├── schema/
+│   ├── schema.sql                  ← SQLite schema + views (safe to re-run)
+│   └── migrations/                 ← idempotent one-off migrations
+├── pipeline/
+│   ├── keepa_api_offers.py         ← Path B: per-seller API collector (--tick/--status/--seller-names)
+│   ├── keepa_viewer_export.py      ← Path A: Selenium → Keepa Viewer CSV export
+│   ├── keepa_csv_importer.py       ← Path A: CSV → fct_keepa_daily
+│   ├── replenishment.py            ← SHIP/HOLD/AVOID/WATCH recommendation engine
+│   ├── health_check.py             ← data-quality checks + retention purge + housekeeping
+│   ├── db.py                       ← shared sqlite helpers (get_conn, init_db, upsert_product)
+│   └── .env                        ← KEEPA_API_KEY, DB_PATH (gitignored)
 ├── dashboard/
-│   ├── dashboard.py                 ← Streamlit analytics dashboard
-│   └── explore.ipynb                ← Jupyter notebook for ad-hoc SQL queries
-├── dash_app/                        ← Plotly Dash app (DuckDB-over-SQLite, zero-ETL)
-│   ├── app.py                       ← run: DB_PATH=pipeline/amazon_tracker.db python3 dash_app/app.py
-│   └── data.py                      ← DuckDB data-access layer (attaches SQLite read-only)
+│   ├── dashboard.py                ← Streamlit dashboard (primary UI today)
+│   └── explore.ipynb               ← ad-hoc SQL notebook
+├── dash_app/                       ← newer Plotly Dash + DuckDB UI (read-only, partial)
+│   ├── app.py
+│   └── data.py
 ├── scripts/
-│   └── daily_pipeline.sh            ← orchestration: runs the full daily pipeline
-├── docs/                            ← reference + recovery runbooks
-└── config/
-    └── .env.template                ← copy this to pipeline/.env
+│   ├── daily_pipeline.sh           ← orchestrated daily run (launchd/cron)
+│   └── com.amazontracker.daily.plist
+└── docs/
+    ├── keepa_api_reference.md      ← Keepa field + token reference
+    └── HANDOFF.md                  ← session handoff notes
 ```
 
-> **Note:** The original Selenium AOD scraper and several earlier collector attempts
-> have been deleted. The per-seller stock/price history now comes from the Keepa
-> **API** (`keepa_api_offers.py`), not the browser AOD panel. The Chrome/AOD sections
-> below are retained as historical reference only and do not describe code that still
-> exists in this repo.
-
 ---
 
-## ⚠️ CRITICAL: Chrome + Keepa Architecture (Read Before Touching create_driver)
-
-### The problem
-- Keepa extension must be **logged in** to inject stock numbers per seller in the AOD panel
-- Keepa is installed in the user's real Chrome under **Profile 9** (cantalcagri@gmail.com)
-- Selenium **cannot use the user's real Chrome profile** on macOS — Chrome blocks it
-
-### What works (DO NOT REVERT)
-- `create_driver()` uses `pipeline/.chrome_profile/` as `--user-data-dir`
-- Keepa extension **files** are loaded read-only via `--load-extension` from Profile 9
-- CDP mode (`--connect-port 9222`): attaches Selenium to the user's already-running Chrome
-  - Launch Chrome with: `open -a "Google Chrome" --args --remote-debugging-port=9222`
-  - Then run: `python browser_collector.py --asins-file asins.txt --connect-port 9222`
-  - Keepa is already logged in this mode — no login needed
-
-### What does NOT work (do not attempt again)
-1. **CDP on default Chrome profile** — macOS blocks it
-2. **`undetected-chromedriver`** — same macOS restriction
-3. **Copying files from user's real Chrome profile** — destroyed the user's extensions previously, NEVER do this again
-4. **`--user-data-dir` pointing to real Chrome** — fails when real Chrome is running
-
----
-
-## Data model (SQLite star schema)
+## Data model (SQLite — `pipeline/amazon_tracker.db`)
 
 ### dim_product — one row per ASIN
-| Column | Description |
-|---|---|
-| `asin` | Child ASIN being tracked |
-| `parent_asin` | Parent ASIN (variation family) — scraped from page JSON |
-| `title` | Product title |
-| `brand` | Brand name |
-| `variation_size` | e.g. "Large", "X-Large" |
-| `variation_color` | e.g. "Blue", "Black" |
-| `variation_theme` | e.g. "Size_nameColor_name" |
+`asin` (PK), `marketplace`, `parent_asin`, `title`, `brand`, `variation_size`,
+`variation_color`, `image_url`, `gtin`, `item_uid`.
+`marketplace` defaults to `'amazon_us'`. `item_uid`/`gtin` are the
+marketplace-neutral identity used to join across marketplaces and to the Costco
+pipeline (see below).
 
-**Removed columns (do not add back):** `subcategory`, `created_at`, `updated_at`, `category`, `rating`, `rating_count`
-BSR category lives in `fact_bsr_snapshot.bsr_category` — not in dim_product.
+### fct_keepa_daily — daily aggregate snapshot (Path A, never purged)
+One row per (`snapshot_date`, `asin`). Typed columns for charted fields
+(`sales_rank_current`, `buy_box_price`, `buy_box_stock`, `fba_stock`,
+`fba_offers`, `fbm_offers`, `total_offers`, `oos_90d_pct`, `monthly_sold_num`,
+…) plus `raw_json` holding the full CSV row so no Keepa column is ever lost.
 
-### dim_seller — one row per seller + fulfillment
-| Column | Description |
-|---|---|
-| `seller_name` | Seller display name |
-| `seller_url` | Amazon seller page URL |
-| `fulfillment` | "FBA" or "FBM" |
-| `positive_pct` | % positive ratings |
-| `first_seen_date` | Date first captured |
+### fct_keepa_seller_history — per-seller change events (Path B)
+One row per (`asin`, `seller_id`, `change_time`). Columns: `stock`,
+`price_cents`, `shipping_cents`, `is_fba`, `is_prime`. Source of
+`v_asin_daily_sales`. Retention is enforced two ways: old events are skipped at
+insert (`HISTORY_RETENTION_DAYS`), AND `health_check.py --purge` deletes rows
+older than the cutoff (insert-time skipping alone does not shrink stored rows).
 
-**Removed columns (do not add back):** `rating`, `rating_count`, `updated_at`
+### dim_keepa_seller — seller_id → name/rating
+`seller_id` (PK), `seller_name`, `rating_pct`, `review_count`, `is_amazon`,
+`updated_at`. Names cost 1 token each via `/seller`; resolved lazily for newly
+seen sellers, so we pay once per seller.
 
-### fact_seller_snapshot — daily price + inventory (10-day rolling)
-| Column | Description |
-|---|---|
-| `snapshot_date` | Date of capture |
-| `product_id` | FK to dim_product |
-| `seller_id` | FK to dim_seller |
-| `price` | Listed price |
-| `shipping_cost` | Shipping (0 if FREE) |
-| `total_price` | Generated: price + shipping |
-| `inventory` | Units in stock (from Keepa) |
-| `is_buy_box_winner` | 1 if this is the buy-box seller |
+### asin_api_state — per-ASIN fetch bookkeeping
+Drives the stalest-first queue. `last_fetched_at`, `last_attempted_at`,
+`fetch_success`, `error_msg`, `offer_count`, `offers_successful`,
+`offers_truncated` (1 when Keepa saw more offers than the `offers=20` cap
+returned — per-seller data for that ASIN is partial).
 
-**Removed columns (do not add back):** `snapshot_hour`, `raw_json`, `delivery_date`
+### pipeline_runs — one row per orchestrated daily run
+Audit trail; drives the dashboard "last run" indicator.
 
-### fact_bsr_snapshot — BSR per product per day (10-day rolling)
-| Column | Description |
-|---|---|
-| `snapshot_date` | Date of capture |
-| `product_id` | FK to dim_product |
-| `bsr_rank` | Numeric rank |
-| `bsr_category` | Category string |
+### Views
+- **`v_asin_daily_sales`** — canonical per-ASIN daily units sold (per-seller deltas + seller-disappeared credit). **Use this.**
+- `v_daily_sales` — fallback units sold from aggregate `fba_stock` deltas (only for ASINs without per-seller data yet).
 
-**Removed columns (do not add back):** `snapshot_hour`
-
-### fact_daily_units_sold — calculated sales (kept forever)
-### agg_product_daily — daily summary per product (kept forever)
+### Deprecated
+- `fct_asin_daily` — output of the deleted AOD scraper. Nothing writes it. Do not build on it.
 
 ---
 
-## ⚠️ CRITICAL: AOD Panel Parsing
+## Multi-marketplace / Costco identity
 
-### The "Unknown seller" problem — SOLVED
-The AOD (All Offers Display) side panel has a **"See more" / "See less" toggle** on the buy-box block:
-- **Before clicking "See more"**: Stock number is visible, seller name is HIDDEN
-- **After clicking "See more" (→ "See less")**: Seller name visible, stock HIDDEN
+The Amazon ASIN is **not** a stable cross-marketplace key. To join an Amazon
+listing to its Costco equivalent (or amazon.ca/.de later), use `item_uid` /
+`gtin` on `dim_product`:
+- `marketplace` distinguishes `amazon_us`, `amazon_ca`, `costco_us`, …
+- `item_uid` is the canonical product (same physical product across marketplaces).
+- `gtin` (UPC/EAN) bridges to external sources like Costco.
 
-**Fix implemented in `_expand_see_more()`:**
-1. Read `innerText` BEFORE clicking → captures stock
-2. Click "See more"
-3. Read `innerText` AFTER clicking → captures seller name
-4. Merge both texts → `_parse_offer_block()` gets both stock AND seller name
-
-### The `element.text` returns empty problem — SOLVED
-The AOD panel is a side drawer rendered off-screen. Selenium's `.text` returns `''` for off-screen elements.
-**Fix:** Always use `driver.execute_script("return arguments[0].innerText;", element)`
-
-### CAPTCHA detection — FIXED
-Old code scanned full page source for the word "captcha" — caused false positives from browser extensions (SellerSprite, etc.).
-**Fix:** Check URL, page title, and actual CAPTCHA form element only.
-
-### Variation params required
-Always use `?th=1&psc=1` in product URL — without it, Amazon shows parent ASIN with no real sellers.
+When adding a marketplace, set `marketplace` on inserts and never assume ASIN
+uniqueness across marketplaces.
 
 ---
 
 ## How to run
 
-### Daily run (CDP mode — recommended, uses your logged-in Chrome)
 ```bash
-# Step 1: Launch Chrome with remote debugging (do this once)
+# Path A — daily aggregate snapshot (needs a logged-in Chrome on :9222)
 open -a "Google Chrome" --args --remote-debugging-port=9222
-
-# Step 2: Run tracker
 cd pipeline
-python browser_collector.py --asins-file asins.txt --connect-port 9222
+python keepa_viewer_export.py --asins-file ../data/asins.txt
 
-# Single ASIN
-python browser_collector.py --asin B0F8QT93ZK --connect-port 9222
+# Path B — per-seller API collector
+python keepa_api_offers.py --tick           # one batch of stalest ASINs (for cron)
+python keepa_api_offers.py --status          # token balance + queue stats (0 tokens)
+python keepa_api_offers.py --seller-names    # resolve names for new sellers (1 token each)
 
-# Schedule every 6 hours
-python browser_collector.py --asins-file asins.txt --connect-port 9222 --scheduler --interval 6
-```
+# Health + housekeeping
+python health_check.py                       # data-quality report (exit 1 if any fail)
+python health_check.py --purge --vacuum      # enforce retention, shrink DB
 
-### Dashboard
-```bash
-cd dashboard
-DB_PATH=../pipeline/amazon_tracker.db streamlit run dashboard.py
-# Open http://localhost:8501
+# Orchestrated daily run (launchd/cron) — see scripts/daily_pipeline.sh
+bash scripts/daily_pipeline.sh
 
-# Or use Jupyter notebook
-jupyter notebook explore.ipynb
+# Dashboard (Streamlit — primary)
+DB_PATH=pipeline/amazon_tracker.db streamlit run dashboard/dashboard.py
+# Dashboard (Dash + DuckDB — newer, partial)
+DB_PATH=pipeline/amazon_tracker.db python3 dash_app/app.py
 ```
 
 ---
@@ -221,10 +179,21 @@ jupyter notebook explore.ipynb
 
 | Variable | Description |
 |---|---|
-| `CHROME_PROFILE_PATH` | Path to tracker's own Chrome profile (not the real one) |
-| `DB_PATH` | SQLite file path (defaults to `amazon_tracker.db`) |
-| `KEEPA_USERNAME` | `trendyzone.sw` |
-| `KEEPA_PASSWORD` | In .env file |
+| `KEEPA_API_KEY` | Keepa HTTP API key (Path B). |
+| `DB_PATH` | SQLite file path (defaults to `pipeline/amazon_tracker.db`). |
+
+---
+
+## Keepa token economics (Path B)
+
+- Plan: **5 tokens/min refill = 7,200/day**, burst cap **300** (over-refill is lost).
+- ~4 tokens/ASIN when batched 100/call (`offers=20` +6, `stock=1` +3, bulk discount).
+- 5,000 ASINs ≈ 20K tokens ≈ ~3 days per full sweep — so each ASIN's *latest*
+  fetch can be ~3 days stale, but Keepa's `stockCSV` backfills the intra-gap
+  history, so resolution is not lost, only latency.
+- **Throughput note:** a tick spends ~400 and needs ≥150 to start, so it can only
+  run ~once every ~80 min of refill. To keep 5,000 ASINs moving you need a
+  **continuous** cron (e.g. every 15 min, 24/7), not a short daily burst.
 
 ---
 
@@ -233,49 +202,21 @@ jupyter notebook explore.ipynb
 | Layer | Tool |
 |---|---|
 | Language | Python 3.10+ |
-| Browser automation | Selenium 4 + webdriver-manager |
-| Database | SQLite (file: `amazon_tracker.db`) |
-| Dashboard | Streamlit + Plotly |
-| Scheduling | `schedule` library |
-| Config | `python-dotenv` |
+| Data source | Keepa (HTTP API + Product Viewer CSV) |
+| Browser automation (Path A only) | Selenium 4 + webdriver-manager |
+| Database | SQLite (`amazon_tracker.db`), WAL mode |
+| Dashboards | Streamlit + Plotly (primary); Dash + DuckDB (newer) |
+| Scheduling | launchd / cron |
+| Config | python-dotenv |
 
 ---
 
-## Common fixes for future agents
+## Gotchas / don't-break list
 
-**"Unknown seller" in logs**
-→ The "See more" toggle hides seller name. `_expand_see_more()` handles this — do not revert.
-
-**"inv=None" for buy-box seller**
-→ Keepa injects "Stock\nN" which may be in the pre-expand text. Check `_expand_see_more()` merges both texts.
-
-**"table X has no column Y" error**
-→ Schema was rewritten — removed many columns. Check schema.sql for current columns before adding any INSERT.
-→ Removed for good: `snapshot_hour`, `raw_json`, `delivery_date`, `subcategory`, `created_at`, `updated_at`, `category`, `rating`, `rating_count`
-
-**"table X already exists" error**
-→ All CREATE statements in schema.sql must use `CREATE TABLE IF NOT EXISTS`
-
-**"disk I/O error" on sqlite3**
-→ WAL journal mode fails on some macOS filesystems. Uses `journal_mode=DELETE` now — do not change back to WAL.
-
-**"CAPTCHA detected" causing 5-min wait on normal pages**
-→ Fixed — CAPTCHA detection now checks URL/title/form element only, not full page source.
-
-**Seller inventory shows None for all sellers**
-→ Keepa is not logged in. Use `--connect-port 9222` to attach to your already-logged-in Chrome.
-
-**Script got blocked by Amazon**
-→ Increase `DELAY_BETWEEN_PAGES` and `DELAY_BETWEEN_ASINS` in `browser_collector.py`
-
----
-
-## What NOT to change without understanding the impact
-
-1. `calculate_units_sold()` — core sales logic
-2. The `UNIQUE` constraints in `schema.sql` — prevent duplicate snapshots
-3. `RETENTION_DAYS = 10` — affects how far back sales can be calculated
-4. The `is_new_seller` flag — removing this inflates sales numbers
-5. `create_driver()` / `create_driver_cdp()` — see Chrome + Keepa architecture above
-6. `_expand_see_more()` — captures both stock and seller name from AOD toggle
-7. `driver.execute_script("return arguments[0].innerText;", el)` — do NOT use `.text` for AOD elements
+1. `v_asin_daily_sales` — core units-sold logic. Verify against a test DB before changing.
+2. `UNIQUE`/`PRIMARY KEY` constraints in `schema.sql` — prevent duplicate snapshots.
+3. `HISTORY_RETENTION_DAYS = 90` in `keepa_api_offers.py` — affects how far back sales can be computed. Purge job uses the same cutoff.
+4. The DB must live on a **local APFS path**, never iCloud/Dropbox/network — that's what caused the old "disk I/O error", not WAL itself.
+5. `offers=20` returns only the top 20 offers; ASINs with more sellers are partial (`offers_truncated=1`). Don't treat per-seller totals as complete for those.
+6. Re-running `schema.sql` is non-destructive. Schema *migrations* live in `schema/migrations/` and are idempotent.
+7. Secrets: rotate the Keepa API key and any GitHub PAT embedded in the git remote URL.

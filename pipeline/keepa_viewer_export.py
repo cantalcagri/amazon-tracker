@@ -73,7 +73,7 @@ def set_download_dir(driver: webdriver.Chrome, path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     driver.execute_cdp_cmd(
         "Browser.setDownloadBehavior",
-        {"behavior": "allow", "downloadPath": str(path), "eventsEnabled": True},
+        {"behavior": "allow", "downloadPath": str(path.resolve()), "eventsEnabled": True},
     )
     log.info("Download dir set to %s", path)
 

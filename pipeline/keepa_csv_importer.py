@@ -54,15 +54,33 @@ FIELD_PATTERNS: dict[str, list[str]] = {
     "pct_top_seller_30d": [r"%?\s*top\s*seller.*30"],
     "pct_top_seller_90d": [r"%?\s*top\s*seller.*90"],
     "is_fba_pct":         [r"^buy\s*box:\s*is\s*fba", r"%\s*fba"],
-    # NEW: offer counts, FBA/FBM stock and prices
-    "fba_offers":         [r"^new\s*fba\s*offer\s*count.*current",
-                           r"buy\s*box.*eligible.*new\s*fba"],
-    "fbm_offers":         [r"^new\s*fbm\s*offer\s*count.*current",
-                           r"buy\s*box.*eligible.*new\s*fbm"],
+    # Offer counts: match the TOTAL "New FBA/FBM Offer Count: Current" — NOT the
+    # "Buy Box Eligible Offer Counts: New FBA" subset (that's a different, smaller
+    # number and appears earlier in the header row, so it used to win by mistake).
+    "fba_offers":         [r"new\s*fba\s*offer\s*count.*current"],
+    "fbm_offers":         [r"new\s*fbm\s*offer\s*count.*current"],
+    "new_offer_count":    [r"^new\s*offer\s*count.*current"],
     "total_offers":       [r"^total\s*offer\s*count"],
     "fba_stock":          [r"3rd\s*party\s*fba.*stock"],
     "fba_price":          [r"3rd\s*party\s*fba.*current"],
     "fbm_price":          [r"3rd\s*party\s*fbm.*current"],
+    # Product identity codes — the bridge to Costco / other marketplaces.
+    "gtin":               [r"product\s*codes:\s*gtin", r"^gtin$"],
+    "upc":                [r"product\s*codes:\s*upc", r"^upc$"],
+    "ean":                [r"product\s*codes:\s*ean", r"^ean$"],
+    "part_number":        [r"part\s*number", r"partnumber"],
+    # Profitability + physical
+    "referral_fee_pct":   [r"referral\s*fee\s*%", r"referral\s*fee(?!.*based)"],
+    "fba_pick_pack_fee":  [r"fba\s*pick.*pack\s*fee", r"pick\s*&?\s*pack"],
+    "weight_g":           [r"^item:\s*weight", r"^weight\s*\(g\)"],
+    "return_rate":        [r"return\s*rate"],
+    # Reviews + sales signals
+    "rating":             [r"^reviews:\s*rating(?!\s*count)", r"^rating$"],
+    "rating_count":       [r"^reviews:\s*rating\s*count$", r"^rating\s*count$"],
+    "bought_past_month":  [r"bought\s*in\s*past\s*month"],
+    "monthly_sold_peak":  [r"monthly\s*sold\s*\(peak\)"],
+    "pct_amazon_30d":     [r"buy\s*box:\s*%\s*amazon\s*30"],
+    "pct_amazon_90d":     [r"buy\s*box:\s*%\s*amazon\s*90"],
 }
 
 
@@ -92,6 +110,28 @@ def to_int(val) -> int | None:
         return int(m.group(0))
     except ValueError:
         return None
+
+
+def parse_magnitude(val) -> int | None:
+    """Parse Keepa magnitude strings like '50+', '1K+', '2.5K', '3M' into an int.
+
+    Keepa's "Monthly Sold" column uses K/M suffixes and a trailing '+'
+    ('1K+ bought in past month'). A naive int-regex turns '1K+' into 1 — a
+    ~1000x undercount that then poisons the velocity fallback. We expand the
+    suffix here. Returns None for blanks/dashes.
+    """
+    if val is None:
+        return None
+    s = str(val).strip().replace(",", "").replace("+", "").replace("#", "")
+    if not s or s.lower() in {"-", "?", "n/a"}:
+        return None
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*([kKmM]?)\s*$", s)
+    if not m:
+        # Unexpected format — fall back to the first integer found.
+        m2 = re.search(r"-?\d+", s)
+        return int(m2.group(0)) if m2 else None
+    mult = {"": 1, "k": 1_000, "m": 1_000_000}[m.group(2).lower()]
+    return int(round(float(m.group(1)) * mult))
 
 
 def to_float(val) -> float | None:
@@ -150,17 +190,20 @@ def import_csv(csv_path: Path, snapshot: date | None = None) -> int:
                 skipped += 1
                 continue
 
-            title       = to_text(row.get(cols["title"]))       if "title" in cols else None
-            brand       = to_text(row.get(cols["brand"]))       if "brand" in cols else None
-            parent_asin = to_text(row.get(cols["parent_asin"])) if "parent_asin" in cols else None
-            color       = to_text(row.get(cols["color"]))       if "color" in cols else None
-            size        = to_text(row.get(cols["size"]))        if "size" in cols else None
-            image_url   = to_text(row.get(cols["image_url"]))   if "image_url" in cols else None
+            def g(field):  # helper: resolved cell text for a field, or None
+                return to_text(row.get(cols.get(field, "")))
+
             upsert_product(
-                conn, asin, title=title, brand=brand,
-                parent_asin=parent_asin,
-                variation_color=color, variation_size=size,
-                image_url=image_url,
+                conn, asin,
+                title=g("title"), brand=g("brand"),
+                parent_asin=g("parent_asin"),
+                variation_color=g("color"), variation_size=g("size"),
+                image_url=g("image_url"),
+                gtin=g("gtin"), upc=g("upc"), ean=g("ean"),
+                part_number=g("part_number"),
+                weight_g=to_float(row.get(cols.get("weight_g", ""))),
+                referral_fee_pct=to_float(row.get(cols.get("referral_fee_pct", ""))),
+                fba_pick_pack_fee=to_float(row.get(cols.get("fba_pick_pack_fee", ""))),
             )
 
             monthly_sold_raw = to_text(row.get(cols.get("monthly_sold", "")))
@@ -171,7 +214,7 @@ def import_csv(csv_path: Path, snapshot: date | None = None) -> int:
                 "sales_rank_30d_avg": to_int(row.get(cols.get("sales_rank_30d_avg", ""))),
                 "display_group":      to_text(row.get(cols.get("display_group", ""))),
                 "monthly_sold":       monthly_sold_raw,
-                "monthly_sold_num":   to_int(monthly_sold_raw),
+                "monthly_sold_num":   parse_magnitude(monthly_sold_raw),
                 "monthly_sold_date":  to_text(row.get(cols.get("monthly_sold_date", ""))),
                 "buy_box_price":      to_float(row.get(cols.get("buy_box_price", ""))),
                 "buy_box_stock":      to_int(row.get(cols.get("buy_box_stock", ""))),
@@ -186,6 +229,14 @@ def import_csv(csv_path: Path, snapshot: date | None = None) -> int:
                 "fba_stock":          to_int(row.get(cols.get("fba_stock", ""))),
                 "fba_price":          to_float(row.get(cols.get("fba_price", ""))),
                 "fbm_price":          to_float(row.get(cols.get("fbm_price", ""))),
+                "new_offer_count":    to_int(row.get(cols.get("new_offer_count", ""))),
+                "rating":             to_float(row.get(cols.get("rating", ""))),
+                "rating_count":       to_int(row.get(cols.get("rating_count", ""))),
+                "bought_past_month":  parse_magnitude(to_text(row.get(cols.get("bought_past_month", "")))),
+                "monthly_sold_peak":  parse_magnitude(to_text(row.get(cols.get("monthly_sold_peak", "")))),
+                "pct_amazon_30d":     to_float(row.get(cols.get("pct_amazon_30d", ""))),
+                "pct_amazon_90d":     to_float(row.get(cols.get("pct_amazon_90d", ""))),
+                "return_rate":        to_float(row.get(cols.get("return_rate", ""))),
                 "raw_json":           json.dumps(row, ensure_ascii=False),
             }
 
@@ -198,6 +249,8 @@ def import_csv(csv_path: Path, snapshot: date | None = None) -> int:
                     pct_top_seller_30d, pct_top_seller_90d, is_fba_pct,
                     fba_offers, fbm_offers, total_offers,
                     fba_stock, fba_price, fbm_price,
+                    new_offer_count, rating, rating_count, bought_past_month,
+                    monthly_sold_peak, pct_amazon_30d, pct_amazon_90d, return_rate,
                     raw_json
                 ) VALUES (
                     :snapshot_date, :asin, :sales_rank_current, :sales_rank_30d_avg,
@@ -206,6 +259,8 @@ def import_csv(csv_path: Path, snapshot: date | None = None) -> int:
                     :pct_top_seller_30d, :pct_top_seller_90d, :is_fba_pct,
                     :fba_offers, :fbm_offers, :total_offers,
                     :fba_stock, :fba_price, :fbm_price,
+                    :new_offer_count, :rating, :rating_count, :bought_past_month,
+                    :monthly_sold_peak, :pct_amazon_30d, :pct_amazon_90d, :return_rate,
                     :raw_json
                 )
                 """,

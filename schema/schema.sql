@@ -14,17 +14,40 @@
 -- ============================================================
 
 -- dim_product: one row per tracked child ASIN
+--
+-- Multi-marketplace identity (see CLAUDE.md "Multi-marketplace / Costco"):
+--   marketplace — 'amazon_us' (default), 'amazon_ca', 'costco_us', ...
+--   item_uid    — marketplace-neutral product key; same physical product shares
+--                 one item_uid across marketplaces. NULL until assigned.
+--   gtin        — UPC/EAN, the bridge to external sources like the Costco pipeline.
+-- The Amazon ASIN is NOT unique across marketplaces; join cross-marketplace on
+-- item_uid / gtin, never on asin alone.
 CREATE TABLE IF NOT EXISTS dim_product (
     asin           TEXT PRIMARY KEY,
+    marketplace    TEXT NOT NULL DEFAULT 'amazon_us',
     parent_asin    TEXT,
     title          TEXT,
     brand          TEXT,
     variation_size  TEXT,
     variation_color TEXT,
-    image_url       TEXT  -- Amazon CDN URL (from Keepa "Swatch Image" column)
+    image_url       TEXT,  -- Amazon CDN URL (from Keepa "Swatch Image" column)
+    gtin            TEXT,   -- GTIN (marketplace-neutral; bridges to Costco etc.)
+    upc             TEXT,   -- UPC code (Product Codes: UPC)
+    ean             TEXT,   -- EAN code (Product Codes: EAN)
+    part_number     TEXT,   -- manufacturer part number
+    weight_g        REAL,   -- item weight in grams (for shipping/FBA fee calc)
+    referral_fee_pct  REAL, -- Amazon referral fee %
+    fba_pick_pack_fee REAL, -- FBA pick & pack fee ($)
+    item_uid        TEXT    -- canonical product id shared across marketplaces
 );
+CREATE INDEX IF NOT EXISTS idx_dim_product_item_uid ON dim_product(item_uid);
+CREATE INDEX IF NOT EXISTS idx_dim_product_gtin     ON dim_product(gtin);
+CREATE INDEX IF NOT EXISTS idx_dim_product_upc      ON dim_product(upc);
 
--- fct_asin_daily: one row per ASIN per day
+-- fct_asin_daily: DEPRECATED — output of the deleted Selenium AOD scraper.
+-- Nothing writes this table anymore. Kept only so old explore.ipynb queries
+-- don't crash. Do not build new code on it; use fct_keepa_daily +
+-- fct_keepa_seller_history instead. Safe to DROP once no notebook references it.
 -- sellers: JSON array [{name, fulfillment, price, inventory}, ...]
 -- units_sold: diff vs previous day — NULL on first capture (no baseline)
 CREATE TABLE IF NOT EXISTS fct_asin_daily (
@@ -73,6 +96,14 @@ CREATE TABLE IF NOT EXISTS fct_keepa_daily (
     fba_stock             INTEGER,   -- New, 3rd Party FBA: Stock (aggregate)
     fba_price             REAL,      -- New, 3rd Party FBA: Current
     fbm_price             REAL,      -- New, 3rd Party FBM: Current
+    new_offer_count       INTEGER,   -- New Offer Count: Current
+    rating                REAL,      -- Reviews: Rating (stars)
+    rating_count          INTEGER,   -- Reviews: Rating Count
+    bought_past_month     INTEGER,   -- Monthly Sales Trends: Bought in past month
+    monthly_sold_peak     INTEGER,   -- Monthly Sales Trends: Monthly Sold (Peak)
+    pct_amazon_30d        REAL,      -- Buy Box: % Amazon 30 days (Amazon-as-competitor)
+    pct_amazon_90d        REAL,      -- Buy Box: % Amazon 90 days
+    return_rate           REAL,      -- Return Rate
     raw_json              TEXT,
     PRIMARY KEY (snapshot_date, asin)
 );
@@ -100,6 +131,9 @@ CREATE INDEX IF NOT EXISTS idx_seller_hist_asin_time
     ON fct_keepa_seller_history(asin, change_time);
 CREATE INDEX IF NOT EXISTS idx_seller_hist_seller_time
     ON fct_keepa_seller_history(seller_id, change_time);
+-- Drives the retention purge (health_check.py --purge): DELETE WHERE change_time < cutoff.
+CREATE INDEX IF NOT EXISTS idx_seller_hist_time
+    ON fct_keepa_seller_history(change_time);
 
 -- Seller dimension: stable seller_id → name + rating.
 -- Updated on each API fetch with the latest seen data.
@@ -119,7 +153,9 @@ CREATE TABLE IF NOT EXISTS asin_api_state (
     last_attempted_at DATETIME,      -- most recent attempt (success or fail)
     fetch_success   INTEGER,         -- 1 if last attempt succeeded
     error_msg       TEXT,
-    offer_count     INTEGER          -- live offers seen on last fetch
+    offer_count     INTEGER,         -- live offers seen on last fetch
+    offers_successful INTEGER,       -- offers Keepa captured (may exceed returned)
+    offers_truncated  INTEGER        -- 1 = >offers cap; per-seller data is partial
 );
 
 -- Pipeline run log: one row per orchestrated daily run (written by
@@ -135,12 +171,28 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
     notes           TEXT
 );
 
+-- API token-usage log: one row per Keepa API call. Keepa bills by data returned
+-- (offers + history depth), so cost/ASIN VARIES a lot — this table makes the real
+-- average measurable (see keepa_api_offers.py --status). 0 tokens to maintain.
+CREATE TABLE IF NOT EXISTS api_token_log (
+    ts              DATETIME NOT NULL,
+    endpoint        TEXT,            -- 'product' | 'seller'
+    asin_count      INTEGER,         -- ASINs/sellers in the call
+    tokens_consumed INTEGER,
+    tokens_left     INTEGER,         -- balance reported AFTER the call
+    with_history    INTEGER          -- 1 if history=1 was requested (product calls)
+);
+CREATE INDEX IF NOT EXISTS idx_api_token_log_ts ON api_token_log(ts);
+
 -- ────────────────────────────────────────────────────────────────────────
 -- v_asin_daily_sales: TRUE daily units sold per ASIN, computed from
 -- per-seller stock changes using the spec:
 --   * Seller's stock decreased  → units_sold = (prev_stock - new_stock)
 --   * Seller's stock increased  → restock, ignored (returns 0)
 --   * Brand-new seller (no prior event) → excluded (first observation)
+--   * Seller disappeared → the collector writes a synthetic stock=0 event
+--     (Keepa's -1 marker, or P0-1 dead-offer detection in keepa_api_offers.py),
+--     so the final stock-down to 0 is credited as sold here automatically.
 -- Summed across all sellers for each (asin, change_date).
 -- ────────────────────────────────────────────────────────────────────────
 DROP VIEW IF EXISTS v_asin_daily_sales;

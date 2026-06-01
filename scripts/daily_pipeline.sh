@@ -55,15 +55,31 @@ sqlq() { sqlite3 "$DB_PATH" "$1" 2>>"$RUN_LOG"; }
 log "=== daily_pipeline START (repo=$REPO_DIR) ==="
 SELLER_EVENTS_BEFORE="$(sqlq 'SELECT COUNT(*) FROM fct_keepa_seller_history' || echo 0)"
 
-# ── 1. CSV export (Selenium; tolerant) ─────────────────────────────────────
+# ── 1. CSV export (Keepa Viewer via dedicated Chrome profile on :9222) ──────
+# Uses the isolated .chrome_keepa profile — NOT the user's main Chrome account.
+# Chrome must be running (start_dashboard.sh launches it automatically at login).
 if [ "${SKIP_CSV:-0}" = "1" ]; then
   log "Step 1: CSV export SKIPPED (SKIP_CSV=1)"
 else
-  log "Step 1: Keepa Viewer CSV export"
-  if ( cd "$PIPELINE_DIR" && "$PYTHON" keepa_viewer_export.py --asins-file "$ASINS_FILE" ) >>"$RUN_LOG" 2>&1; then
+  log "Step 1: Keepa Viewer CSV export (dedicated Chrome profile, port 9222)"
+  VENV_PY="$REPO_DIR/.venv/bin/python"
+  [ ! -x "$VENV_PY" ] && VENV_PY="$PYTHON"
+  if ( cd "$PIPELINE_DIR" && "$VENV_PY" keepa_viewer_export.py \
+        --asins-file "$ASINS_FILE" \
+        --connect-port 9222 \
+        --download-dir "$PIPELINE_DIR/keepa_exports" ) >>"$RUN_LOG" 2>&1; then
     log "  CSV export OK"
+    # Import the latest CSV
+    LATEST_CSV=$(ls -t "$PIPELINE_DIR/keepa_exports/"*.csv 2>/dev/null | head -1)
+    if [ -n "$LATEST_CSV" ]; then
+      if ( cd "$PIPELINE_DIR" && "$VENV_PY" keepa_csv_importer.py "$LATEST_CSV" ) >>"$RUN_LOG" 2>&1; then
+        log "  CSV import OK → $LATEST_CSV"
+      else
+        warn "CSV import failed"
+      fi
+    fi
   else
-    warn "CSV export failed (see $RUN_LOG; check Chrome + login, see docs/keepa_viewer_recovery.md)"
+    warn "CSV export failed — is Keepa Chrome running? Check logs/run_*.log"
   fi
 fi
 
