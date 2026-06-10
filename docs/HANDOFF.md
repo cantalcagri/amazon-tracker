@@ -8,6 +8,35 @@ Copy this whole file into a new conversation so the next session has full contex
 **Amazon Tracker** at `/Users/cagri/Desktop/amazon-tracker` — tracks 5,087 Amazon
 ASINs via Keepa. Two data sources feed one SQLite DB + a public dashboard.
 
+## Session 2026-06-09 — gap fixes (commit dece1cc). READ THIS FIRST.
+Root causes found + fixed for the June 2-9 data gaps:
+1. **NULL-BSR API rows** — `history=0` product calls returned no rank data, so
+   every API-written daily row June 2-9 had NULL BSR. Fixed: all `/product`
+   calls now pass `stats=90` (0 extra tokens) and parse `stats.current[3]`.
+   NEVER remove the stats param.
+2. **Slot-1 loop unsharded** — launched without `KEEPA_N_SLOTS=2`, so it
+   re-fetched slot 2's half of the catalog (~50% of key 1's tokens wasted,
+   both keys pinned at ~-420). Fixed: `KEEPA_N_SLOTS=2` in `pipeline/.env`,
+   loops take explicit `--slot N --n-slots 2` argv (visible in `ps`, which the
+   watchdog needs — env vars are invisible there).
+3. **Daily CSV never automated** — the launchd job `com.amazontracker.daily`
+   failed silently with TCC exit 126 since setup (macOS blocks launchd from
+   Desktop paths). Only June 1 ever had a CSV import. Fixed:
+   `scripts/csv_scheduler.sh` (nohup loop from the Login Item) runs
+   `daily_pipeline.sh` daily after 8am local. Also fixed: chromedriver pinned
+   to the RUNNING Chrome's version, BSD `seq 1 0` counting down, `set -u`
+   crash on a unicode arrow, UTC/local `snapshot_date` mismatch (now LOCAL).
+4. **Phase-2 "historical backfill" was never running** — the old
+   backfill_status.txt was aspirational; backfill_progress.py only monitored.
+   Paused intentionally (freshness first); resume commands in
+   `pipeline/backfill_status.txt`.
+5. ~200 ASINs have never shown a BSR (mostly apparel variations whose rank
+   lives on the parent ASIN). They're deprioritized in the queue: refetched
+   weekly, not every sweep.
+Dashboard gained Overview + Data health views, CSV-freshness pill, search.
+Verification: June 9 has 5,087/5,087 daily rows (4,832 with BSR); first
+post-fix API batch wrote BSR for 96/100 ASINs.
+
 ## ⚠️ Hard rules (do not violate)
 - **NEVER use the user's Claude-account Gmail (`cantalcagri@gmail.com`) for Chrome,
   Keepa, Amazon, or anything in this pipeline.** It must stay disconnected.
