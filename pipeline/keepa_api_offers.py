@@ -103,6 +103,12 @@ KEEPA_EPOCH_MIN = 21564000  # offset to convert keepa-minute → unix-minute
 # velocity, restock detection, and recent-trend charts. Saves DB space.
 HISTORY_RETENTION_DAYS = 90
 
+# One-time historical-BSR backfill: per tick, at most this many ASINs that have
+# never had a history=1 pass (asin_api_state.history_done=0) are upgraded to
+# history=1 (+5 tok each, paid ONCE per ASIN ever). Spreads the catalog-wide
+# backfill over a few sweeps without starving per-seller freshness.
+HISTORY_BACKFILL_PER_TICK = int(os.environ.get("KEEPA_HISTORY_PER_TICK", 25))
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -920,6 +926,37 @@ def show_status(conn: sqlite3.Connection) -> None:
 
 
 # ── Main run ──────────────────────────────────────────────────────────────
+def _ensure_history_done_column(conn: sqlite3.Connection) -> None:
+    """Idempotent: add asin_api_state.history_done (1 = this ASIN already had
+    its one-time history=1 BSR backfill, never pay the +5 tokens again).
+
+    On first run, ASINs that already have deep BSR history (rows older than
+    45 days) are stamped done so we don't re-buy what we have.
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(asin_api_state)")]
+    if "history_done" in cols:
+        return
+    conn.execute("ALTER TABLE asin_api_state ADD COLUMN history_done INTEGER NOT NULL DEFAULT 0")
+    conn.execute("""
+        UPDATE asin_api_state SET history_done = 1 WHERE asin IN (
+            SELECT asin FROM fct_keepa_daily
+            WHERE sales_rank_current IS NOT NULL
+              AND snapshot_date < date('now', '-45 day')
+            GROUP BY asin)
+    """)
+    conn.commit()
+    n = conn.execute("SELECT SUM(history_done=0) FROM asin_api_state").fetchone()[0]
+    log.info("history_done column added — %s ASINs queued for one-time BSR backfill", n)
+
+
+def _mark_history_done(conn: sqlite3.Connection, asins) -> None:
+    asins = list(asins)
+    if asins:
+        conn.executemany("UPDATE asin_api_state SET history_done=1 WHERE asin=?",
+                         [(a,) for a in asins])
+        conn.commit()
+
+
 def _new_asins(conn: sqlite3.Connection, asins: list[str]) -> set[str]:
     """Return the subset of ASINs that have never been fetched before.
     These get history=1 so we backfill their full BSR/price timeline.
@@ -933,19 +970,32 @@ def _new_asins(conn: sqlite3.Connection, asins: list[str]) -> set[str]:
     return set(asins) - already_fetched
 
 
+def _history_pending(conn: sqlite3.Connection, asins: list[str]) -> set[str]:
+    """ASINs in this batch still owed their one-time history=1 backfill."""
+    rows = conn.execute(
+        "SELECT asin FROM asin_api_state WHERE asin IN ({}) "
+        "AND COALESCE(history_done, 0) = 0".format(",".join("?" * len(asins))),
+        asins,
+    ).fetchall()
+    return {r["asin"] for r in rows}
+
+
 def tick(conn: sqlite3.Connection, dry_run: bool = False,
          batch_size: int = MAX_BATCH_SIZE, with_history: bool = False) -> int:
     """One tick: pick a batch, fetch, save. Returns # ASINs processed.
 
     Smart history mode (default):
-      - New ASINs (never fetched before) → history=1, full 90-day BSR backfill.
-        Up to 20 per tick to keep token spend bounded (~9 tok/ASIN vs ~4).
-      - Known ASINs → history=0 (cost-optimal, just today's snapshot).
+      - ASINs owed their ONE-TIME history=1 pass (never fetched before, or
+        history_done=0 from before the smart-history era) → full 90-day BSR
+        backfill, up to HISTORY_BACKFILL_PER_TICK per tick, then stamped
+        history_done so the +5 tok is never paid again for that ASIN.
+      - All other ASINs → history=0 (cost-optimal, just today's snapshot).
     Pass with_history=True to force history=1 for all ASINs in the batch.
     """
     if not API_KEY:
         log.error("KEEPA_API_KEY not set in environment / .env")
         return 0
+    _ensure_history_done_column(conn)
 
     # 1. Token check
     try:
@@ -974,28 +1024,33 @@ def tick(conn: sqlite3.Connection, dry_run: bool = False,
 
     total_processed = 0
 
-    # 3a. New ASINs: history=1 for full BSR backfill (max 20 per tick)
+    # 3a. One-time history=1 backfill: new ASINs + ASINs never stamped
+    # history_done (capped per tick to bound token spend at +5 tok each)
     if not with_history:
-        new = sorted(_new_asins(conn, asins))[:20]
-        if new:
-            log.info("New ASINs in batch: %d → fetching with history=1 (full backfill)", len(new))
+        hist = sorted(_new_asins(conn, asins) | _history_pending(conn, asins))
+        hist = hist[:HISTORY_BACKFILL_PER_TICK]
+        if hist:
+            log.info("History backfill in batch: %d ASINs → history=1 (one-time)", len(hist))
             try:
-                data = fetch_products(new, with_history=True)
+                data = fetch_products(hist, with_history=True)
             except Exception as e:
                 log.error("History fetch failed: %s", e)
-                mark_failures(conn, new, str(e))
-                new = []
-            if new:
-                log_token_usage(conn, "product", len(new), data, True)
+                mark_failures(conn, hist, str(e))
+                hist = []
+            if hist:
+                log_token_usage(conn, "product", len(hist), data, True)
                 products = data.get("products", []) or []
                 stats = parse_and_save(conn, products, write_daily=True)
-                log.info("New ASINs: %d · %d daily-rows (history) · %d stock",
+                log.info("History backfill: %d ASINs · %d daily-rows · %d stock",
                          stats["asins"], stats.get("daily_rows", 0), stats["stock_events"])
-                missing = [a for a in new if a not in stats.get("processed_asins", set())]
+                missing = [a for a in hist if a not in stats.get("processed_asins", set())]
                 if missing: mark_failures(conn, missing, "no product returned by Keepa")
+                # Stamp even the missing ones: Keepa has no product for them, so
+                # retrying the +5 tok history pass every sweep would buy nothing.
+                _mark_history_done(conn, hist)
                 total_processed += stats["asins"]
-        # Remove new ASINs from the main batch
-        known_asins = [a for a in asins if a not in set(new if not with_history else [])]
+        # Remove history-pass ASINs from the main batch
+        known_asins = [a for a in asins if a not in set(hist)]
     else:
         known_asins = asins
 
@@ -1023,6 +1078,8 @@ def tick(conn: sqlite3.Connection, dry_run: bool = False,
         if missing:
             log.warning("%d ASINs not returned by Keepa — marking failed", len(missing))
             mark_failures(conn, missing, "no product returned by Keepa")
+        if with_history:
+            _mark_history_done(conn, known_asins)
         total_processed += stats["asins"]
 
     # 5. Auto-resolve seller names

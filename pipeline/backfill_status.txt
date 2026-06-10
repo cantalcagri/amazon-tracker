@@ -10,15 +10,16 @@ Actual state (2026-06-09):
     fetches of new ASINs in early June + old CSV imports of the small catalog).
   • The remaining ~4,600 ASINs have BSR only from June 1 onward.
 
-Decision (2026-06-09): FRESHNESS FIRST.
-  • Historical backfill is paused until daily coverage is healthy.
-  • The daily CSV import (scripts/csv_scheduler.sh) now builds BSR history
-    forward for ALL ASINs at zero token cost.
-  • API daily rows now carry BSR too (stats=90 fix in keepa_api_offers.py).
-
-To run the historical backfill later (~9 tok/ASIN, ~45K tokens ≈ 3 days on
-two keys), do a one-time sweep per slot:
-  cd pipeline
-  python3 keepa_api_offers.py --loop --history --slot 1 --n-slots 2 --max-batches 23
-  python3 keepa_api_offers.py --loop --history --slot 2 --n-slots 2 --max-batches 23
-(Stop the normal watchdog loops first so the queue isn't contended.)
+UPDATE 2026-06-10: AUTOMATIC ONE-TIME BACKFILL NOW RUNNING.
+  • asin_api_state.history_done tracks which ASINs have had their one-time
+    history=1 pass (+5 tok, paid once per ASIN ever). 4,551 queued; 536 that
+    already had deep history were stamped done at migration.
+  • Each tick upgrades up to KEEPA_HISTORY_PER_TICK (default 25) of its batch
+    to history=1, so the backfill completes in ~3-4 sweeps (~1.5-2 weeks)
+    without starving per-seller freshness. Raise the env var to finish faster
+    at the cost of slower sweeps. Progress check:
+      sqlite3 amazon_tracker.db "SELECT history_done, COUNT(*) FROM asin_api_state GROUP BY 1"
+  • The daily CSV import (scripts/csv_scheduler.sh) builds BSR history forward
+    for ALL ASINs at zero token cost; API daily rows carry BSR via stats=90.
+  • Per-seller stock history needs NO backfill — every fetch returns each
+    seller's full stockCSV timeline and we keep the 90-day window.
