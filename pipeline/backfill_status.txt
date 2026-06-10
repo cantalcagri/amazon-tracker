@@ -1,0 +1,24 @@
+=== HISTORICAL BACKFILL STATUS (corrected 2026-06-09) ===
+
+Reality check: the earlier version of this file claimed "Phase 2 IN PROGRESS,
+4,359 ASINs with full 90-day history, ETA June 9-10". That was wrong — no
+process was running a --history pass. The collector loops fetch known ASINs
+with history=0, which does NOT backfill historical BSR.
+
+Actual state (2026-06-09):
+  • ~453 ASINs have >=30 days of BSR history (from the one-time history=1
+    fetches of new ASINs in early June + old CSV imports of the small catalog).
+  • The remaining ~4,600 ASINs have BSR only from June 1 onward.
+
+Decision (2026-06-09): FRESHNESS FIRST.
+  • Historical backfill is paused until daily coverage is healthy.
+  • The daily CSV import (scripts/csv_scheduler.sh) now builds BSR history
+    forward for ALL ASINs at zero token cost.
+  • API daily rows now carry BSR too (stats=90 fix in keepa_api_offers.py).
+
+To run the historical backfill later (~9 tok/ASIN, ~45K tokens ≈ 3 days on
+two keys), do a one-time sweep per slot:
+  cd pipeline
+  python3 keepa_api_offers.py --loop --history --slot 1 --n-slots 2 --max-batches 23
+  python3 keepa_api_offers.py --loop --history --slot 2 --n-slots 2 --max-batches 23
+(Stop the normal watchdog loops first so the queue isn't contended.)

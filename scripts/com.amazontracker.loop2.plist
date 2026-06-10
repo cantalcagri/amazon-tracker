@@ -8,6 +8,10 @@
         <string>/usr/bin/python3</string>
         <string>/Users/cagri/Desktop/amazon-tracker/pipeline/keepa_api_offers.py</string>
         <string>--loop</string>
+        <string>--slot</string>
+        <string>2</string>
+        <string>--n-slots</string>
+        <string>2</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/cagri/Desktop/amazon-tracker/pipeline</string>

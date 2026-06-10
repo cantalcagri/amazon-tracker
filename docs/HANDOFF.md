@@ -25,13 +25,26 @@ The API also writes BSR/price to `fct_keepa_daily` for free (from `salesRankCurr
 + offerCSV). **New ASINs** get `history=1` (full 90-day BSR backfill, ~9 tok);
 **known ASINs** get `history=0` (today only). See `docs/DATA_SOURCING_PLAN.md`.
 
-## What's running right now (background, nohup)
-- **Collector loop** (`keepa_api_offers.py --loop`) — token-aware, fires a 100-ASIN
-  batch whenever balance ≥150, sleeps precisely for refill. ~1,000 ASINs/day.
-- **Watchdog** (`scripts/watchdog.sh`) — restarts the loop within 15 min if it dies.
+## What's running right now (background, nohup) — updated 2026-06-09
+- **TWO collector loops** (`keepa_api_offers.py --loop --slot N --n-slots 2`) —
+  dual API keys, queue sharded by ASIN hash. Each supervised by its own
+  watchdog instance (`scripts/watchdog.sh`, slot via KEEPA_API_KEY_SLOT).
+  ⚠️ History: before 2026-06-09 slot 1 ran UNSHARDED (no KEEPA_N_SLOTS) and
+  re-fetched slot 2's ASINs — ~50% token waste. Fixed: `KEEPA_N_SLOTS=2` is in
+  `pipeline/.env`, and slots are now explicit `--slot` argv (visible in ps).
+- **CSV scheduler** (`scripts/csv_scheduler.sh`) — runs `daily_pipeline.sh`
+  once/day after 8am local: Keepa Viewer CSV export+import (free BSR/price for
+  ALL ASINs), health check, DB backup. Replaces the launchd daily job, which
+  had been failing silently with TCC exit 126 since setup.
 - **Dashboard** (Streamlit, `.venv`, port 8502) + **Cloudflare tunnel** (public URL).
-- Login Item `~/start_amazon_tracker.command` starts the watchdog at login.
-  `scripts/start_dashboard.sh` starts dashboard + tunnel + Keepa Chrome.
+  Views: Overview, Trends, Replenishment, Data health.
+- Login Item `~/start_amazon_tracker.command` starts both watchdogs + the CSV
+  scheduler at login. `scripts/start_dashboard.sh` starts dashboard + tunnel +
+  Keepa Chrome.
+- **API daily rows now carry BSR**: product calls pass `stats=90` (0 extra
+  tokens); without it, history=0 fetches wrote NULL-BSR rows (the June 2-9 gap).
+- Historical 90-day BSR backfill is PAUSED (freshness first) — see
+  `pipeline/backfill_status.txt` for the resume commands.
 
 Check state: `cd pipeline && /usr/bin/python3 keepa_api_offers.py --status`
 Dashboard URL: `bash scripts/dashboard_url.sh`

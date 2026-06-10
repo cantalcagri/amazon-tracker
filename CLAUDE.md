@@ -155,10 +155,15 @@ open -a "Google Chrome" --args --remote-debugging-port=9222
 cd pipeline
 python keepa_viewer_export.py --asins-file ../data/asins.txt
 
-# Path B — per-seller API collector
+# Path B — per-seller API collector (dual-key: two loops, sharded queue)
+python keepa_api_offers.py --loop --slot 1 --n-slots 2   # key 1, half the catalog
+python keepa_api_offers.py --loop --slot 2 --n-slots 2   # key 2, other half
 python keepa_api_offers.py --tick           # one batch of stalest ASINs (for cron)
 python keepa_api_offers.py --status          # token balance + queue stats (0 tokens)
 python keepa_api_offers.py --seller-names    # resolve names for new sellers (1 token each)
+# Normally supervised: scripts/watchdog.sh (one instance per slot) + the daily
+# CSV via scripts/csv_scheduler.sh — all started by the Login Item
+# ~/start_amazon_tracker.command (launchd is TCC-blocked for Desktop paths).
 
 # Health + housekeeping
 python health_check.py                       # data-quality report (exit 1 if any fail)
@@ -179,7 +184,9 @@ DB_PATH=pipeline/amazon_tracker.db python3 dash_app/app.py
 
 | Variable | Description |
 |---|---|
-| `KEEPA_API_KEY` | Keepa HTTP API key (Path B). |
+| `KEEPA_API_KEY` | Keepa HTTP API key, slot 1 (Path B). |
+| `KEEPA_API_KEY_2` | Second Keepa key, slot 2 (doubles throughput). |
+| `KEEPA_N_SLOTS` | Total key slots (2). MUST be set or a loop fetches the whole catalog and wastes the other key's work. CLI `--n-slots` overrides. |
 | `DB_PATH` | SQLite file path (defaults to `pipeline/amazon_tracker.db`). |
 
 ---
@@ -220,3 +227,12 @@ DB_PATH=pipeline/amazon_tracker.db python3 dash_app/app.py
 5. `offers=20` returns only the top 20 offers; ASINs with more sellers are partial (`offers_truncated=1`). Don't treat per-seller totals as complete for those.
 6. Re-running `schema.sql` is non-destructive. Schema *migrations* live in `schema/migrations/` and are idempotent.
 7. Secrets: rotate the Keepa API key and any GitHub PAT embedded in the git remote URL.
+8. API `/product` calls MUST pass `stats=90` (0 extra tokens). Without it,
+   `history=0` fetches return no BSR and the daily rows go in NULL (caused the
+   June 2-9 2026 BSR gap).
+9. `snapshot_date` is the LOCAL calendar date everywhere (collector + CSV
+   importer). Don't switch either side to UTC — evening fetches would split
+   one real day across two rows.
+10. `last_fetched_at` etc. are ISO strings with `T`; SQLite `datetime('now')`
+   emits a space. Same-day string comparisons between the two are off by hours
+   — use `julianday()` for time math, not string `>=`.

@@ -10,4 +10,4 @@
 #        launchctl load ~/Library/LaunchAgents/com.amazontracker.loop2.plist
 #   3. Or just run manually: bash scripts/loop2.sh
 cd /Users/cagri/Desktop/amazon-tracker/pipeline
-exec /usr/bin/python3 keepa_api_offers.py --loop
+exec /usr/bin/python3 keepa_api_offers.py --loop --slot 2 --n-slots 2

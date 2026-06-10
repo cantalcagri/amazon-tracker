@@ -60,10 +60,30 @@ def build_viewer_url(asins: list[str]) -> str:
     return f"https://keepa.com/#!viewer/{encoded}"
 
 
+def _running_chrome_version(port: int) -> str | None:
+    """Major version of the Chrome actually listening on the CDP port.
+
+    The installed Chrome.app can be newer than the long-running Keepa Chrome
+    process (auto-update on disk, no relaunch). webdriver-manager keys off the
+    installed binary, downloads a too-new driver, and the connect fails — so
+    pin the driver to the RUNNING browser instead.
+    """
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=5) as r:
+            browser = json.loads(r.read().decode())["Browser"]  # "Chrome/148.0.7778.216"
+        return browser.split("/", 1)[1].split(".", 1)[0]
+    except Exception as e:
+        log.warning("Could not read running Chrome version from :%d (%s)", port, e)
+        return None
+
+
 def connect_cdp(port: int) -> webdriver.Chrome:
     opts = Options()
     opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    major = _running_chrome_version(port)
+    mgr = ChromeDriverManager(driver_version=major) if major else ChromeDriverManager()
+    driver = webdriver.Chrome(service=Service(mgr.install()), options=opts)
     driver.set_page_load_timeout(120)
     log.info("Attached to Chrome on port %d", port)
     return driver

@@ -85,7 +85,8 @@ fi
 
 # ── 2. Per-seller API ticks ─────────────────────────────────────────────────
 log "Step 2: per-seller API ticks (x$TICKS, ${TICK_SLEEP}s apart)"
-for i in $(seq 1 "$TICKS"); do
+# Guard: BSD seq counts DOWN for `seq 1 0`, so TICKS=0 would run 2 ticks
+for i in $(if [ "$TICKS" -ge 1 ]; then seq 1 "$TICKS"; fi); do
   if ( cd "$PIPELINE_DIR" && "$PYTHON" keepa_api_offers.py --tick ) >>"$RUN_LOG" 2>&1; then
     log "  tick $i/$TICKS OK"
   else
@@ -140,13 +141,13 @@ fi
 
 # ── 6. Log the run ──────────────────────────────────────────────────────────
 FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-CSV_ROWS_TODAY="$(sqlq "SELECT COUNT(*) FROM fct_keepa_daily WHERE snapshot_date = date('now')" || echo 0)"
+CSV_ROWS_TODAY="$(sqlq "SELECT COUNT(*) FROM fct_keepa_daily WHERE snapshot_date = date('now','localtime')" || echo 0)"
 SELLER_EVENTS_AFTER="$(sqlq 'SELECT COUNT(*) FROM fct_keepa_seller_history' || echo 0)"
 NOTES_ESC="$(printf '%s' "${NOTES#; }" | sed "s/'/''/g")"
 
 sqlq "INSERT INTO pipeline_runs (started_at, finished_at, status, csv_rows_today, seller_events, notes)
       VALUES ('$STARTED_AT', '$FINISHED_AT', '$STATUS', $CSV_ROWS_TODAY, $SELLER_EVENTS_AFTER, '$NOTES_ESC');"
 
-log "=== daily_pipeline END status=$STATUS csv_today=$CSV_ROWS_TODAY seller_events=$SELLER_EVENTS_BEFORE→$SELLER_EVENTS_AFTER ==="
+log "=== daily_pipeline END status=$STATUS csv_today=$CSV_ROWS_TODAY seller_events=${SELLER_EVENTS_BEFORE}->${SELLER_EVENTS_AFTER} ==="
 
 [ "$STATUS" = "failed" ] && exit 1 || exit 0

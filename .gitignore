@@ -41,3 +41,6 @@ dashboard/dashboard_full_backup.py
 *.xlsx
 KeepaExport-*.csv
 pipeline/keepa_exports/
+
+# One-off scripts archive (contains a leaked Telegram bot token - do not commit)
+archive/

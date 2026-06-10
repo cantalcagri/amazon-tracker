@@ -252,6 +252,10 @@ def live_status():
     if table_exists("api_token_log"):
         r = c.execute("SELECT tokens_left FROM api_token_log WHERE endpoint='product' ORDER BY ts DESC LIMIT 1").fetchone()
         d["tokens_left"] = r[0] if r else None
+    # Freshness of the free daily CSV import (rows with raw_json) — the BSR/
+    # price source for ALL ASINs. >1 day old means the daily export missed.
+    r = c.execute("SELECT MAX(snapshot_date) FROM fct_keepa_daily WHERE raw_json IS NOT NULL").fetchone()
+    d["last_csv"] = r[0] if r else None
     return d
 
 
@@ -270,7 +274,8 @@ def ago(ts):
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 st.sidebar.markdown("## 📦 Amazon Tracker")
-view = st.sidebar.radio("View", ["📈 Trends", "🎯 Replenishment"], label_visibility="collapsed")
+view = st.sidebar.radio("View", ["🏠 Overview", "📈 Trends", "🎯 Replenishment", "🩺 Data health"],
+                        index=1, label_visibility="collapsed")
 window = st.sidebar.select_slider("Date window", options=[7, 14, 30, 60, 90], value=30,
                                   format_func=lambda d: f"{d} days")
 end_d, start_d = date.today(), date.today() - timedelta(days=window)
@@ -289,16 +294,21 @@ ls = live_status()
 last_ago, is_live = ago(ls.get("last_fetch"))
 dot = GREEN if is_live else ORANGE
 pct = 100.0 * ls["fetched"] / ls["catalog"] if ls.get("catalog") else 0
+csv_d = ls.get("last_csv")
+csv_age = (date.today() - date.fromisoformat(csv_d)).days if csv_d else None
+csv_cl = GREEN if csv_age is not None and csv_age <= 1 else RED
+csv_txt = (f"{csv_d} ({csv_age}d old)" if csv_age and csv_age > 1 else (csv_d or "never"))
 st.markdown(f"""
 <h2 style='margin:0 0 2px'>📦 Amazon Product Tracker</h2>
 <div style='display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 6px'>
   <span class='pill'><span class='dot' style='background:{dot};box-shadow:0 0 10px {dot}'></span>
     <b>{'COLLECTING' if is_live else 'IDLE'}</b></span>
-  <span class='pill'>Backfill&nbsp;<b>{ls['fetched']:,}/{ls['catalog']:,}</b>&nbsp;({pct:.0f}%)</span>
+  <span class='pill'>Coverage&nbsp;<b>{ls['fetched']:,}/{ls['catalog']:,}</b>&nbsp;({pct:.0f}%)</span>
   <span class='pill'>Stock events&nbsp;<b>{ls['stock_events']:,}</b></span>
   <span class='pill'>Sellers&nbsp;<b>{ls['sellers']:,}</b></span>
   <span class='pill'>Tokens&nbsp;<b>{ls.get('tokens_left','—')}</b></span>
   <span class='pill'>Last fetch&nbsp;<b>{last_ago}</b></span>
+  <span class='pill'>Daily CSV&nbsp;<b style='color:{csv_cl}'>{csv_txt}</b></span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -320,6 +330,14 @@ if view == "📈 Trends":
                   {where} ORDER BY sellers DESC, title LIMIT 4000""", params)
     if asins.empty:
         st.info("No products for this brand yet."); st.stop()
+    needle = st.sidebar.text_input("🔍 Search", placeholder="ASIN, title or brand…").strip()
+    if needle:
+        m = asins["asin"].str.contains(needle, case=False, na=False) | \
+            asins["title"].str.contains(needle, case=False, na=False)
+        if m.any():
+            asins = asins[m]
+        else:
+            st.sidebar.caption("No match — showing all.")
     labels = {f"{'🏪'+str(int(r.sellers)) if r.sellers else '⏳'}  {r.asin} — {r.title[:46]}": r.asin
               for r in asins.itertuples()}
     asin = labels[st.sidebar.selectbox(f"ASIN ({len(labels)})", list(labels.keys()))]
@@ -578,6 +596,192 @@ if view == "📈 Trends":
                              "Stock": st.column_config.NumberColumn(format="%d"),
                              "Rating %": st.column_config.NumberColumn(format="%d%%"),
                          })
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OVERVIEW — catalog-wide pulse
+# ═════════════════════════════════════════════════════════════════════════════
+elif view == "🏠 Overview":
+    tot = q("""SELECT
+                 (SELECT COUNT(*) FROM dim_product) catalog,
+                 (SELECT COUNT(DISTINCT asin) FROM v_asin_daily_sales
+                   WHERE sale_date >= ?) selling,
+                 (SELECT COALESCE(SUM(units_sold),0) FROM v_asin_daily_sales
+                   WHERE sale_date >= ?) sold,
+                 (SELECT COUNT(DISTINCT asin) FROM fct_keepa_daily
+                   WHERE snapshot_date >= ? AND sales_rank_current IS NOT NULL) with_bsr""",
+            [start_d.isoformat()] * 3)
+    t = tot.iloc[0]
+
+    def kpi(label, val, color=TEXT):
+        return (f"<div class='kpi'><div class='l'>{label}</div>"
+                f"<div class='v' style='color:{color}'>{val}</div></div>")
+    st.markdown("<div style='display:flex;gap:12px;margin:6px 0 4px;flex-wrap:wrap'>"
+                + kpi("Catalog", f"{int(t['catalog']):,}")
+                + kpi(f"Units sold · {window}d", f"{int(t['sold']):,}", GREEN)
+                + kpi(f"ASINs with sales · {window}d", f"{int(t['selling']):,}", CYAN)
+                + kpi(f"ASINs with BSR · {window}d", f"{int(t['with_bsr']):,}", INDIGO)
+                + "</div>", unsafe_allow_html=True)
+
+    section("Catalog activity")
+    c1, c2 = st.columns(2)
+    with card("📊 Units sold per day", "Catalog-wide measured sales (per-seller stock drops).", c1):
+        daily = q("""SELECT sale_date Date, SUM(units_sold) sold FROM v_asin_daily_sales
+                     WHERE sale_date >= ? GROUP BY 1 ORDER BY 1""", [start_d.isoformat()])
+        if daily.empty:
+            show(empty("No sales in window yet."))
+        else:
+            daily["Date"] = pd.to_datetime(daily["Date"])
+            fig = go.Figure(go.Bar(x=daily["Date"], y=daily["sold"], marker_color=GREEN,
+                                   hovertemplate="%{y:,} sold<extra></extra>"))
+            fig.update_layout(**_layout()); time_axis(fig, start_d, end_d, "Units")
+            show(fig)
+    with card("🏆 Top sellers (units)", f"Best-moving ASINs over the last {window} days.", c2):
+        top = q("""SELECT s.asin, COALESCE(d.title, s.asin) title,
+                          SUM(s.units_sold) sold
+                   FROM v_asin_daily_sales s LEFT JOIN dim_product d ON d.asin=s.asin
+                   WHERE s.sale_date >= ? GROUP BY s.asin
+                   ORDER BY sold DESC LIMIT 15""", [start_d.isoformat()])
+        if top.empty:
+            show(empty("No sales in window yet."))
+        else:
+            top["title"] = top["title"].str.slice(0, 38)
+            fig = go.Figure(go.Bar(
+                x=top["sold"][::-1], y=(top["asin"] + " · " + top["title"])[::-1],
+                orientation="h", marker_color=CYAN,
+                hovertemplate="%{y}<br>%{x:,} units<extra></extra>"))
+            fig.update_layout(**_layout(440))
+            fig.update_xaxes(gridcolor=GRID, color=AXIS)
+            fig.update_yaxes(color=AXIS, tickfont=dict(size=10.5))
+            show(fig)
+
+    section("Movers & brands")
+    c3, c4 = st.columns(2)
+    with card("🚀 BSR movers", "Biggest rank improvement: first vs latest BSR in window.", c3):
+        mv = q("""WITH w AS (SELECT asin, snapshot_date, sales_rank_current bsr
+                             FROM fct_keepa_daily
+                             WHERE snapshot_date >= ? AND sales_rank_current IS NOT NULL),
+                  f AS (SELECT asin, bsr FROM (SELECT asin, bsr, ROW_NUMBER() OVER
+                          (PARTITION BY asin ORDER BY snapshot_date) rn FROM w) WHERE rn=1),
+                  l AS (SELECT asin, bsr FROM (SELECT asin, bsr, ROW_NUMBER() OVER
+                          (PARTITION BY asin ORDER BY snapshot_date DESC) rn FROM w) WHERE rn=1)
+                  SELECT f.asin, COALESCE(d.title,f.asin) title,
+                         f.bsr first_bsr, l.bsr last_bsr, f.bsr - l.bsr improve
+                  FROM f JOIN l ON l.asin=f.asin LEFT JOIN dim_product d ON d.asin=f.asin
+                  WHERE f.bsr != l.bsr ORDER BY improve DESC LIMIT 12""",
+                [start_d.isoformat()])
+        if mv.empty:
+            st.caption("Not enough BSR history in window yet.")
+        else:
+            mv = mv.rename(columns={"asin": "ASIN", "title": "Title", "first_bsr": "BSR start",
+                                    "last_bsr": "BSR now", "improve": "Δ better"})
+            st.dataframe(mv, use_container_width=True, hide_index=True, height=420,
+                         column_config={"Title": st.column_config.TextColumn(width="large"),
+                                        "BSR start": st.column_config.NumberColumn(format="%d"),
+                                        "BSR now": st.column_config.NumberColumn(format="%d"),
+                                        "Δ better": st.column_config.NumberColumn(format="%d")})
+    with card("🏷️ Brand summary", f"Sales + coverage per brand, last {window} days.", c4):
+        br = q("""SELECT COALESCE(d.brand,'(no brand)') Brand,
+                         COUNT(DISTINCT d.asin) ASINs,
+                         COALESCE(SUM(s.units_sold),0) "Units sold"
+                  FROM dim_product d
+                  LEFT JOIN v_asin_daily_sales s ON s.asin=d.asin AND s.sale_date >= ?
+                  GROUP BY 1 ORDER BY "Units sold" DESC LIMIT 25""",
+                [start_d.isoformat()])
+        st.dataframe(br, use_container_width=True, hide_index=True, height=420,
+                     column_config={"Units sold": st.column_config.NumberColumn(format="%d")})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DATA HEALTH — coverage, freshness, pipeline runs
+# ═════════════════════════════════════════════════════════════════════════════
+elif view == "🩺 Data health":
+    st.markdown("### 🩺 Data health")
+    cov = q("""SELECT snapshot_date Date, COUNT(*) rows_total,
+                      SUM(sales_rank_current IS NOT NULL) rows_bsr
+               FROM fct_keepa_daily WHERE snapshot_date >= ?
+               GROUP BY 1 ORDER BY 1""", [(date.today() - timedelta(days=45)).isoformat()])
+    c1, c2 = st.columns(2)
+    with card("📅 Daily snapshot coverage", "Rows per day vs rows that carry a BSR. "
+              "Both lines should track the full catalog size.", c1):
+        if cov.empty:
+            show(empty("No snapshots yet."))
+        else:
+            cov["Date"] = pd.to_datetime(cov["Date"])
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=cov["Date"], y=cov["rows_total"], name="Rows",
+                                     line=dict(color=INDIGO, width=3), mode="lines"))
+            fig.add_trace(go.Scatter(x=cov["Date"], y=cov["rows_bsr"], name="With BSR",
+                                     line=dict(color=GREEN, width=3), mode="lines",
+                                     fill="tozeroy", fillcolor="rgba(61,220,151,0.08)"))
+            fig.update_layout(**_layout()); time_axis(fig, date.today() - timedelta(days=45), end_d, "ASINs")
+            show(fig)
+    with card("⛽ API fetch staleness", "When each ASIN was last fetched by the per-seller API. "
+              "With two keys the whole catalog should cycle in ~2-3 days.", c2):
+        stale = q("""SELECT CASE
+                       WHEN last_fetched_at >= datetime('now','-1 day') THEN '< 1 day'
+                       WHEN last_fetched_at >= datetime('now','-2 day') THEN '1-2 days'
+                       WHEN last_fetched_at >= datetime('now','-3 day') THEN '2-3 days'
+                       WHEN last_fetched_at IS NOT NULL THEN '> 3 days'
+                       ELSE 'never' END bucket, COUNT(*) n
+                     FROM asin_api_state GROUP BY 1""")
+        if stale.empty:
+            show(empty("No fetch state yet."))
+        else:
+            order = ["< 1 day", "1-2 days", "2-3 days", "> 3 days", "never"]
+            stale["bucket"] = pd.Categorical(stale["bucket"], categories=order, ordered=True)
+            stale = stale.sort_values("bucket")
+            colors = [GREEN, CYAN, INDIGO, ORANGE, RED][:len(stale)]
+            fig = go.Figure(go.Bar(x=stale["bucket"].astype(str), y=stale["n"],
+                                   marker_color=colors,
+                                   hovertemplate="%{x}: %{y:,} ASINs<extra></extra>"))
+            fig.update_layout(**_layout())
+            fig.update_xaxes(color=AXIS); fig.update_yaxes(gridcolor=GRID, color=AXIS, title="ASINs")
+            show(fig)
+
+    section("Pipeline & tokens")
+    c3, c4 = st.columns(2)
+    with card("🪙 Token spend (7 days)", "Per-product-call token cost from api_token_log.", c3):
+        if table_exists("api_token_log"):
+            tok = q("""SELECT SUBSTR(ts,1,10) Date, SUM(tokens_consumed) spent
+                       FROM api_token_log WHERE ts >= datetime('now','-7 day')
+                       GROUP BY 1 ORDER BY 1""")
+        else:
+            tok = pd.DataFrame()
+        if tok.empty:
+            show(empty("No token log yet."))
+        else:
+            tok["Date"] = pd.to_datetime(tok["Date"])
+            fig = go.Figure(go.Bar(x=tok["Date"], y=tok["spent"], marker_color=VIOLET,
+                                   hovertemplate="%{y:,} tokens<extra></extra>"))
+            fig.add_hline(y=14400, line=dict(color=ORANGE, dash="dot"),
+                          annotation_text="2-key daily refill (14.4K)",
+                          annotation_font_color=MUTED)
+            fig.update_layout(**_layout())
+            fig.update_xaxes(tickformat="%b %d", color=AXIS)
+            fig.update_yaxes(gridcolor=GRID, color=AXIS, title="Tokens")
+            show(fig)
+    with card("🗓️ Recent pipeline runs", "Orchestrated daily runs (CSV import, health check, backup).", c4):
+        if table_exists("pipeline_runs"):
+            runs = q("""SELECT SUBSTR(started_at,1,16) "Started (UTC)", status Status,
+                               csv_rows_today "CSV rows", seller_events "Seller events",
+                               COALESCE(notes,'') Notes
+                        FROM pipeline_runs ORDER BY started_at DESC LIMIT 14""")
+        else:
+            runs = pd.DataFrame()
+        if runs.empty:
+            st.caption("No orchestrated runs logged yet.")
+        else:
+            st.dataframe(runs, use_container_width=True, hide_index=True, height=360)
+
+    section("Known data caveats")
+    st.markdown(f"""
+- **Per-seller totals are a lower bound** for ASINs with more than 20 offers
+  (`offers_truncated=1`) — Keepa returns only the top 20 offers.
+- **Units sold is a lower bound**: a restock between two observations can mask sales.
+- **BSR before June 2026** exists only for ~450 ASINs (historical backfill is paused —
+  freshness first). The daily CSV builds full-catalog history forward from here.
+""")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

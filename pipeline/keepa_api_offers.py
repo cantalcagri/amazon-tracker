@@ -48,18 +48,32 @@ from dotenv import load_dotenv
 HERE = Path(__file__).parent
 load_dotenv(HERE / ".env")
 
-# Active API key — override with KEEPA_API_KEY_SLOT=2 env var to use the second
-# key. Each slot gets its own shard of the ASIN queue (by ASIN hash) so the two
+# Active API key — set via --slot CLI flag or KEEPA_API_KEY_SLOT env var.
+# Each slot gets its own shard of the ASIN queue (by ASIN hash) so the two
 # loop instances never request the same ASIN and never burn each other's tokens.
 _SLOT = int(os.environ.get("KEEPA_API_KEY_SLOT", "1"))
-if _SLOT == 2:
-    API_KEY = os.environ.get("KEEPA_API_KEY_2") or os.environ.get("KEEPA_API_KEY")
-else:
-    API_KEY = os.environ.get("KEEPA_API_KEY")
+API_KEY = os.environ.get("KEEPA_API_KEY")
 
 # Total number of key slots configured (1 = single key, 2 = dual key, etc.)
 # Used to shard the queue: slot N owns ASINs where hash(asin) % N_SLOTS == N-1
 N_SLOTS = int(os.environ.get("KEEPA_N_SLOTS", "1"))
+
+
+def set_slot(slot: int | None = None, n_slots: int | None = None) -> None:
+    """Resolve slot/key globals. The --slot CLI flag (visible in `ps`, unlike env
+    vars) wins over KEEPA_API_KEY_SLOT so supervisors can tell loops apart."""
+    global _SLOT, N_SLOTS, API_KEY
+    if slot is not None:
+        _SLOT = slot
+    if n_slots is not None:
+        N_SLOTS = n_slots
+    if _SLOT == 2:
+        API_KEY = os.environ.get("KEEPA_API_KEY_2") or os.environ.get("KEEPA_API_KEY")
+    else:
+        API_KEY = os.environ.get("KEEPA_API_KEY")
+
+
+set_slot()
 
 DB_PATH = os.environ.get("DB_PATH", str(HERE / "amazon_tracker.db"))
 KEEPA_BASE = "https://api.keepa.com"
@@ -175,14 +189,25 @@ def _extract_daily_snapshots(p: dict, today: str,
     live_ids = set(p.get("liveOffersOrder") or [])
     live_offers = [o for o in offers if o.get("offerId") in live_ids]
 
+    # stats.current is an array indexed like the csv[] types (3=BSR, 18=buy box
+    # incl. shipping); -1 means "no data". Present whenever stats=N is requested,
+    # even with history=0 — the primary BSR source for cheap known-ASIN fetches.
+    stats_current = stats.get("current") or []
+
+    def _stat_at(idx: int):
+        if len(stats_current) > idx and stats_current[idx] is not None \
+                and stats_current[idx] >= 0:
+            return stats_current[idx]
+        return None
+
     # ── Today's aggregate fields (current state from live offers) ────────────
-    bsr_current = p.get("salesRankCurrent")
+    bsr_current = p.get("salesRankCurrent") or _stat_at(3)
     if not bsr_current:
         bsr_csv = csv_data[3] if len(csv_data) > 3 else None
         bsr_current = _last_val(bsr_csv)
 
     bb_csv = csv_data[18] if len(csv_data) > 18 else None
-    bb_price_from_history = _cents_to_dollars(_last_val(bb_csv))
+    bb_price_from_history = _cents_to_dollars(_last_val(bb_csv) or _stat_at(18))
 
     # Buy-box stock + price: from the buy-box winner offer (always available).
     bb_stock = None
@@ -225,13 +250,16 @@ def _extract_daily_snapshots(p: dict, today: str,
     fba_price = _cents_to_dollars(min(fba_prices)) if fba_prices else None
     fbm_price = _cents_to_dollars(min(fbm_prices)) if fbm_prices else None
 
-    # OOS 90d % from stats
+    # OOS 90d % from stats. Keepa returns it as an array indexed like csv[]
+    # types (0=Amazon, 1=New, ...) — use New; -1 means no data.
     oos_90d = stats.get("outOfStockPercentage90") or stats.get("outOfStockPercentage")
+    if isinstance(oos_90d, list):
+        oos_90d = oos_90d[1] if len(oos_90d) > 1 else None
     if isinstance(oos_90d, (int, float)):
-        oos_90d = oos_90d / 100.0  # Keepa returns it as 0-100 integer
+        oos_90d = oos_90d / 100.0 if oos_90d >= 0 else None  # 0-100 int → fraction
 
-    # Monthly sold: Keepa returns it in stats.monthlySold (string like "50+")
-    monthly_sold_raw = str(stats.get("monthlySold") or "").strip() or None
+    # Monthly sold: top-level product field (int) or stats (string like "50+")
+    monthly_sold_raw = str(p.get("monthlySold") or stats.get("monthlySold") or "").strip() or None
 
     # Top seller 30d/90d
     pct_top_30 = stats.get("buyBoxSeller30daysPercentage")
@@ -260,7 +288,12 @@ def _extract_daily_snapshots(p: dict, today: str,
     # ── Today's full snapshot ────────────────────────────────────────────────
     today_row = _base(today, bsr_current, bb_price)
     today_row.update({
-        "sales_rank_30d_avg": stats.get("avg30") if isinstance(stats.get("avg30"), int) else None,
+        "sales_rank_30d_avg": (stats.get("avg30")[3]
+                               if isinstance(stats.get("avg30"), list)
+                                  and len(stats.get("avg30")) > 3
+                                  and stats.get("avg30")[3] is not None
+                                  and stats.get("avg30")[3] >= 0
+                               else None),
         "display_group":      display_group,
         "monthly_sold":       monthly_sold_raw,
         "monthly_sold_num":   _parse_magnitude(monthly_sold_raw),
@@ -361,6 +394,10 @@ def fetch_products(asins: list[str], with_history: bool = False) -> dict:
         "offers": OFFERS_PER_PRODUCT,        # +6 tokens/ASIN
         "stock":  1,                         # +3 tokens/ASIN
         "history": 1 if with_history else 0, # +5 tokens/ASIN when on
+        # stats costs 0 extra tokens and returns stats.current (BSR, buy box,
+        # OOS%) even with history=0 — without it, history=0 daily rows have
+        # NULL BSR, which is exactly the gap that hit June 2-9 2026.
+        "stats": 90,
     }
     log.info("API call: %d ASINs (offers=%d, stock=1, history=%d)",
              len(asins), OFFERS_PER_PRODUCT, params["history"])
@@ -506,8 +543,20 @@ def pick_next_batch(conn: sqlite3.Connection, batch_size: int = MAX_BATCH_SIZE) 
         LEFT JOIN fct_keepa_daily k
                ON k.asin = s.asin
               AND k.snapshot_date = (SELECT MAX(snapshot_date) FROM fct_keepa_daily)
+        LEFT JOIN (
+            SELECT asin, MAX(sales_rank_current IS NOT NULL) AS has_bsr
+            FROM fct_keepa_daily GROUP BY asin
+        ) b ON b.asin = s.asin
         WHERE 1=1 {shard_filter}
         ORDER BY
+          -- Dead ASINs last: never showed a BSR and no offers on the latest
+          -- fetch → refetch weekly instead of every sweep, freeing tokens for
+          -- live listings. (They stay in the catalog and still get checked.)
+          CASE WHEN COALESCE(b.has_bsr, 0) = 0
+                    AND COALESCE(s.offer_count, 0) = 0
+                    AND s.last_fetched_at IS NOT NULL
+                    AND julianday('now') - julianday(s.last_fetched_at) < 7.0
+               THEN 1 ELSE 0 END,
           -- Hot ASINs first (only if not fetched in last 24h, otherwise lose priority)
           CASE WHEN is_hot = 1
                     AND (s.last_fetched_at IS NULL
@@ -557,7 +606,10 @@ def parse_and_save(conn: sqlite3.Connection, products: list[dict],
              "gone_events": 0, "skipped_old": 0, "truncated_asins": 0}
     processed: set[str] = set()
 
-    today = now_dt.strftime("%Y-%m-%d")
+    # Local calendar date, matching keepa_csv_importer's date.today() — UTC here
+    # would put evening fetches (after 5pm PDT) on tomorrow's snapshot_date and
+    # split one real day across two rows.
+    today = datetime.now().strftime("%Y-%m-%d")
     seller_rows:  list[tuple] = []   # dim_keepa_seller
     state_rows:   list[tuple] = []   # asin_api_state
     stock_rows:   list[tuple] = []   # (asin, sid, change_time, stock, is_fba, is_prime)
@@ -1066,7 +1118,14 @@ def main() -> int:
                          "fields and the API fetches per-seller stock only (~4 tok/ASIN).")
     ap.add_argument("--max-batches", type=int, default=None,
                     help="With --loop: stop after N batches (for testing). Default: run forever.")
+    ap.add_argument("--slot", type=int, choices=[1, 2], default=None,
+                    help="API key slot (1 or 2). Visible in `ps`, unlike the "
+                         "KEEPA_API_KEY_SLOT env var, so supervisors can tell "
+                         "the two loops apart. Overrides the env var.")
+    ap.add_argument("--n-slots", type=int, default=None,
+                    help="Total key slots (queue shards). Overrides KEEPA_N_SLOTS.")
     args = ap.parse_args()
+    set_slot(args.slot, args.n_slots)
     with_history = args.history
 
     conn = get_conn()
